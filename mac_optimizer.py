@@ -2976,15 +2976,15 @@ table{width:100%;border-collapse:collapse;font-size:12px;table-layout:auto}
 .bucket-title{font-size:12px;font-weight:700;letter-spacing:.4px;
               text-transform:uppercase;color:var(--bad)}
 .bucket-meta{font-size:11px;color:var(--dim)}
-.org-row{display:flex;gap:8px;align-items:stretch;margin:8px 0;padding:8px;
+.org-row{display:block;margin:10px 0;padding:8px;
          border-radius:6px;background:#0e1218;border-left:3px solid #2a3140}
 .org-row.current{border-left-color:var(--good);background:rgba(74,222,128,.04)}
-.org-row-label{flex:0 0 140px;display:flex;flex-direction:column;justify-content:center;
-               padding:0 10px;font-size:12px;font-weight:700;color:var(--fg);
-               border-right:1px solid #1f2530}
-.org-row-label .sub{font-size:10px;font-weight:400;color:var(--dim);margin-top:3px}
+.org-row-label{display:flex;justify-content:space-between;align-items:baseline;
+               padding:2px 4px 8px;font-size:13px;font-weight:700;color:var(--fg);
+               border-bottom:1px solid #1f2530;margin-bottom:8px}
+.org-row-label .sub{font-size:11px;font-weight:400;color:var(--dim)}
 .org-row.current .org-row-label{color:var(--good)}
-.org-cells{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;flex:1;min-width:0}
+.org-cells{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:6px}
 .org-cell{padding:8px;border-radius:5px;background:#161b23;cursor:pointer;
           border:1px solid #1f2530;transition:background .15s, border-color .15s;
           display:flex;flex-direction:column;gap:3px}
@@ -3349,10 +3349,12 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
       <button class="danger" onclick="removeSelectedAgents()">Remove selected</button>
       <span id="agents-selected-info" class="path" style="margin-left:10px"></span>
     </div>
-    <table id="agents-table"><thead>
-      <tr><th style="width:24px"><input type="checkbox" id="agents-select-all" onclick="toggleAllAgents(this)"></th>
-          <th>Label</th><th>Kind</th><th>Modified</th><th></th></tr>
-    </thead><tbody></tbody></table>
+    <div class="table-wrap">
+      <table id="agents-table"><thead>
+        <tr><th style="width:24px"><input type="checkbox" id="agents-select-all" onclick="toggleAllAgents(this)"></th>
+            <th>Label</th><th>Kind</th><th>Modified</th><th></th></tr>
+      </thead><tbody></tbody></table>
+    </div>
   </div>
 
 </div>
@@ -3713,7 +3715,7 @@ async function loadOrphans(){
     document.getElementById('orphan-actions').style.display='none';
     return;
   }
-  list.innerHTML = '<table style="width:100%"><thead><tr><th style="width:24px"></th><th>Folder</th><th>Size</th><th>Last modified</th><th></th></tr></thead><tbody>'+
+  list.innerHTML = '<div class="table-wrap"><table style="width:100%"><thead><tr><th style="width:24px"></th><th>Folder</th><th>Size</th><th>Last modified</th><th></th></tr></thead><tbody>'+
     o.map(x=>`
     <tr data-path='${JSON.stringify(x.path)}'>
       <td><input type="checkbox" class="orphan-cb" onclick="updateOrphanSelection()"></td>
@@ -3721,7 +3723,7 @@ async function loadOrphans(){
       <td><b>${x.size_human}</b></td>
       <td class="path">${x.last_modified}</td>
       <td><button class="danger" onclick='removeOnePath(this,${JSON.stringify(x.path)},${JSON.stringify(x.name)})'>Remove</button></td>
-    </tr>`).join('')+'</tbody></table>';
+    </tr>`).join('')+'</tbody></table></div>';
   updateOrphanSelection();
 }
 function updateOrphanSelection(){
