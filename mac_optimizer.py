@@ -553,6 +553,28 @@ def _power_source():
     if m: info["time_remaining"] = m.group(1)
     return info
 
+# Things a user can do RIGHT NOW to ease CPU throttle when stuck on a worn
+# battery without a charger. Each tip is ranked by realistic wattage savings —
+# every freed watt is a watt the CPU is allowed to use within the same
+# battery budget. Aby learned this the hard way: when his battery hit
+# "Service Recommended" macOS clamped his CPU to 33% and there was no
+# software override. These are the only legit workarounds short of a
+# replacement.
+_BATTERY_WORKAROUND_TIPS = [
+    {"tip": "Plug in ANY USB-C charger — even a 20W iPhone brick or a power bank works",
+     "saves": "biggest win: every external watt supplements the battery, throttle eases within ~30 seconds"},
+    {"tip": "Drop screen brightness to ~30%",
+     "saves": "5-8W (the display is one of the biggest drains on a laptop)"},
+    {"tip": "Quit Chrome / Slack / Spotify / any heavy background app",
+     "saves": "5-10W of sustained CPU heat — see Process Inspector for the worst offender"},
+    {"tip": "Turn off keyboard backlight (F5 / Touch Bar)",
+     "saves": "1-2W"},
+    {"tip": "Disable Bluetooth if you don't need it",
+     "saves": "~1W"},
+    {"tip": "Avoid Low Power Mode — it makes throttling worse, not better, in this scenario",
+     "saves": "(it caps the CPU more aggressively instead of letting it run at battery max)"},
+]
+
 def diagnose_slowness():
     """
     Run a top-to-bottom 'why is my Mac slow right now?' diagnosis. Returns a
@@ -688,6 +710,15 @@ def diagnose_slowness():
     else:
         headline = "Health score is low but no single root cause stands out — check Heal banner for general suggestions."
 
+    # If the top cause is the battery+no-charger case, attach the workaround
+    # tips. They're useless in any other diagnosis context, so we don't always
+    # surface them — Aby's "filter aggressively" rule.
+    workarounds = []
+    if causes and causes[0]["title"].startswith("Worn battery + no charger"):
+        workarounds = _BATTERY_WORKAROUND_TIPS
+    elif causes and "Running on battery" in causes[0]["title"]:
+        workarounds = _BATTERY_WORKAROUND_TIPS
+
     return {
         "headline": headline,
         "score": h["score"],
@@ -695,6 +726,7 @@ def diagnose_slowness():
         "on_ac": power["on_ac"],
         "battery": batt,
         "causes": causes,
+        "workarounds": workarounds,
     }
 
 def get_heal_recommendations():
@@ -4446,6 +4478,15 @@ async function openDiagnoseModal(){
     html += '</div>';
   } else {
     html += '<div class="issue info"><div class="msg">No active slowdown root causes detected.</div><div class="fix">Your Mac is performing within normal limits right now.</div></div>';
+  }
+  // Battery+no-charger workaround tips — only when actually relevant.
+  if(d.workarounds && d.workarounds.length){
+    html += '<div class="story-section"><h3>Things to try right now (no charger needed)</h3>';
+    html += '<ul class="story-actions-list" style="font-size:12px">';
+    for(const w of d.workarounds){
+      html += `<li><b>${esc(w.tip)}</b><div class="path" style="font-size:11px;margin-top:2px">${esc(w.saves)}</div></li>`;
+    }
+    html += '</ul></div>';
   }
   body.innerHTML = html;
 }
