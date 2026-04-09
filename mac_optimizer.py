@@ -471,6 +471,228 @@ def get_process_intel(top=25):
     return filtered[:10]
 
 
+# ─── "Why is my Mac slow right now?" — root-cause diagnosis ─────────────────
+#
+# The Heal banner says *what* to do but doesn't always say *why* the Mac is
+# slow at this moment. This function combines power state, battery health,
+# thermal throttle level, top heat-producing process, and memory pressure
+# into a ranked diagnosis. Each cause has confidence + a one-line fix the
+# user can act on without knowing macOS internals.
+#
+# All data sources are zero-sudo and zero-network: pmset, system_profiler,
+# and our existing process scanner.
+
+def _battery_info():
+    """Cycle count, condition, max-capacity, charging state from system_profiler.
+    Returns dict; missing fields are None on desktops without batteries."""
+    out = sh("system_profiler SPPowerDataType 2>/dev/null", timeout=10)
+    info = {"cycle_count": None, "condition": None, "max_capacity_pct": None,
+            "charging": None, "ac_connected": None, "wattage": None,
+            "adapter_name": None, "charge_remaining_pct": None,
+            "fully_charged": None}
+    if not out:
+        return info
+    in_battery = False
+    for line in out.splitlines():
+        s = line.strip()
+        if "Battery Information:" in line:
+            in_battery = True
+        if "AC Charger Information:" in line:
+            in_battery = False
+        if "Cycle Count:" in s:
+            try: info["cycle_count"] = int(s.split(":",1)[1].strip())
+            except: pass
+        elif "Condition:" in s:
+            info["condition"] = s.split(":",1)[1].strip()
+        elif "Maximum Capacity:" in s:
+            v = s.split(":",1)[1].strip().rstrip("%")
+            try: info["max_capacity_pct"] = int(v)
+            except: pass
+        elif "Charging:" in s and in_battery:
+            info["charging"] = s.split(":",1)[1].strip().lower() == "yes"
+        elif "Connected:" in s:
+            info["ac_connected"] = s.split(":",1)[1].strip().lower() == "yes"
+        elif "Wattage" in s and "(W)" in s:
+            try: info["wattage"] = int(s.split(":",1)[1].strip())
+            except: pass
+        elif "Name:" in s and "Charger" not in s and not in_battery:
+            info["adapter_name"] = s.split(":",1)[1].strip()
+        elif "State of Charge" in s:
+            v = s.split(":",1)[1].strip().rstrip("%")
+            try: info["charge_remaining_pct"] = int(v)
+            except: pass
+        elif "Fully Charged:" in s:
+            info["fully_charged"] = s.split(":",1)[1].strip().lower() == "yes"
+    return info
+
+def _thermal_info():
+    """CPU speed limit + scheduler limit from pmset -g therm. The CPU speed
+    limit is the % of full clock the kernel is allowing — anything below 100
+    means the user is feeling slowness from throttling."""
+    out = sh("pmset -g therm", timeout=5)
+    info = {"cpu_speed_limit": 100, "scheduler_limit": 100, "raw": out}
+    m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", out)
+    if m: info["cpu_speed_limit"] = int(m.group(1))
+    m = re.search(r"CPU_Scheduler_Limit\s*=\s*(\d+)", out)
+    if m: info["scheduler_limit"] = int(m.group(1))
+    return info
+
+def _power_source():
+    """Whether we're on AC or battery, plus time-remaining if on battery."""
+    out = sh("pmset -g batt", timeout=5)
+    info = {"on_ac": False, "charge_pct": None, "time_remaining": None, "raw": out}
+    if "AC Power" in out:
+        info["on_ac"] = True
+    m = re.search(r"(\d+)%", out)
+    if m: info["charge_pct"] = int(m.group(1))
+    m = re.search(r"(\d+:\d+)\s+remaining", out)
+    if m: info["time_remaining"] = m.group(1)
+    return info
+
+def diagnose_slowness():
+    """
+    Run a top-to-bottom 'why is my Mac slow right now?' diagnosis. Returns a
+    structured report with a list of *causes* (each with confidence + fix) and
+    a single headline verdict. The user wants ONE clear answer plus the
+    backing evidence, not a wall of metrics.
+    """
+    h = get_health()
+    therm = _thermal_info()
+    power = _power_source()
+    batt = _battery_info()
+    procs = get_processes()[:5]
+
+    causes = []  # list of {severity, title, evidence, fix, confidence}
+
+    # 1. CPU is being clamped by the kernel — biggest single cause of perceived
+    #    slowness on Apple Silicon laptops. Figure out *why* it's clamped.
+    if therm["cpu_speed_limit"] < 100:
+        # Sub-cause A: running on a degraded battery WITHOUT charger.
+        # Apple Silicon Macs throttle to whatever wattage the battery can
+        # currently deliver — a worn battery (high cycles, "Service
+        # Recommended") simply can't push the CPU at full clock.
+        deg_battery = (
+            (batt.get("cycle_count") or 0) > 800 or
+            (batt.get("condition") and "service" in batt["condition"].lower()) or
+            ((batt.get("max_capacity_pct") or 100) < 80)
+        )
+        if not power["on_ac"] and deg_battery:
+            ev = []
+            if batt.get("cycle_count"): ev.append(f"{batt['cycle_count']} battery cycles")
+            if batt.get("condition"): ev.append(f"battery condition: {batt['condition']}")
+            if batt.get("max_capacity_pct"): ev.append(f"battery max capacity: {batt['max_capacity_pct']}%")
+            ev.append(f"CPU clamped to {therm['cpu_speed_limit']}%")
+            ev.append("no charger plugged in")
+            causes.append({
+                "severity": "critical",
+                "title": "Worn battery + no charger → kernel is throttling your CPU to prevent shutdown",
+                "evidence": ev,
+                "fix": "Plug in your original Apple charger directly to the wall (no hub). Long-term: Apple is recommending battery service — book a Genius Bar appointment.",
+                "confidence": "high",
+            })
+        elif not power["on_ac"]:
+            causes.append({
+                "severity": "warn",
+                "title": f"Running on battery — kernel clamped CPU to {therm['cpu_speed_limit']}%",
+                "evidence": [
+                    f"CPU speed limit: {therm['cpu_speed_limit']}%",
+                    "no charger plugged in",
+                    f"battery: {power['charge_pct']}% / {power['time_remaining']} remaining" if power['charge_pct'] else "",
+                ],
+                "fix": "Plug in the charger. macOS will release the throttle within 30 seconds.",
+                "confidence": "high",
+            })
+        elif power["on_ac"] and (batt.get("wattage") or 0) and batt["wattage"] < 60:
+            causes.append({
+                "severity": "warn",
+                "title": f"Underpowered charger ({batt['wattage']}W) — can't keep up with CPU demand",
+                "evidence": [
+                    f"adapter wattage: {batt['wattage']}W",
+                    f"CPU clamped to {therm['cpu_speed_limit']}%",
+                    "this Mac wants 67W or more under load",
+                ],
+                "fix": "Switch to a 67W+ Apple-branded charger. iPad/iPhone chargers will charge but won't deliver enough power for full CPU.",
+                "confidence": "high",
+            })
+        elif power["on_ac"]:
+            # On AC + healthy charger but still throttled = thermal
+            top = procs[0] if procs else {}
+            causes.append({
+                "severity": "warn",
+                "title": "Thermal throttle — your Mac is hot",
+                "evidence": [
+                    f"CPU clamped to {therm['cpu_speed_limit']}%",
+                    "on AC power (so it's not a power issue)",
+                    f"top heat producer: {top.get('name','?')} at {top.get('cpu',0):.0f}% CPU" if top else "",
+                ],
+                "fix": "Quit the heaviest process (see Process Inspector). Make sure no vents are blocked. Hot ambient room? Move to a cooler spot.",
+                "confidence": "medium",
+            })
+
+    # 2. Memory pressure
+    if h["swap_used_mb"] > 1500 and h["mem_free_pct"] < 30:
+        top_mem = max(procs, key=lambda p: p.get("rss_mb",0)) if procs else {}
+        causes.append({
+            "severity": "critical",
+            "title": "RAM exhausted — macOS is paging to disk (this is what beach-balling feels like)",
+            "evidence": [
+                f"swap used: {h['swap_used_mb']:.0f} MB",
+                f"free memory: {h['mem_free_pct']}%",
+                f"biggest memory user: {top_mem.get('name','?')} ({top_mem.get('rss_mb',0):.0f} MB)" if top_mem else "",
+            ],
+            "fix": f"Quit {top_mem.get('name','the biggest memory hog')} from Process Inspector, then close idle browser tabs.",
+            "confidence": "high",
+        })
+    elif h["swap_used_mb"] > 500:
+        causes.append({
+            "severity": "info",
+            "title": "Mild memory pressure — some swapping happening",
+            "evidence": [f"swap used: {h['swap_used_mb']:.0f} MB", f"free memory: {h['mem_free_pct']}%"],
+            "fix": "Not urgent yet. Quit apps you're not using if it grows.",
+            "confidence": "medium",
+        })
+
+    # 3. A single process pinning the CPU
+    if procs:
+        top = procs[0]
+        if top.get("cpu", 0) > 80:
+            causes.append({
+                "severity": "warn",
+                "title": f"{top['name']} is pinning the CPU at {top['cpu']:.0f}%",
+                "evidence": [f"PID {top['pid']}", f"CPU: {top['cpu']:.0f}%", f"RSS: {top.get('rss_mb',0):.0f} MB"],
+                "fix": f"Open Process Inspector and use the Kill button on {top['name']}. If it comes back, that process is broken — quit its parent app and reopen.",
+                "confidence": "high",
+            })
+
+    # 4. Disk almost full — slows everything from app launch to swap
+    if h["disk_used_pct"] > 90:
+        causes.append({
+            "severity": "critical",
+            "title": "Disk is almost full — macOS slows down dramatically below 10% free",
+            "evidence": [f"disk used: {h['disk_used_pct']}%", f"free: {h['disk_free_gb']:.0f} GB"],
+            "fix": "Use Stale Files / File Organizer / Duplicate Finder cards below to free space. Aim for ≥15% free.",
+            "confidence": "high",
+        })
+
+    # Headline = the highest-severity cause, ordered critical > warn > info.
+    rank = {"critical": 0, "warn": 1, "info": 2}
+    causes.sort(key=lambda c: (rank.get(c["severity"], 9), -len(c["evidence"])))
+    if causes:
+        headline = causes[0]["title"]
+    elif h["score"] >= 80:
+        headline = "Your Mac looks healthy right now — no slowness root cause detected."
+    else:
+        headline = "Health score is low but no single root cause stands out — check Heal banner for general suggestions."
+
+    return {
+        "headline": headline,
+        "score": h["score"],
+        "cpu_speed_limit": therm["cpu_speed_limit"],
+        "on_ac": power["on_ac"],
+        "battery": batt,
+        "causes": causes,
+    }
+
 def get_heal_recommendations():
     """
     Build a single 'Heal My Mac' report: what's wrong, what to do, in plain English.
@@ -631,20 +853,47 @@ def get_permissions_status():
         "all_granted": bool(fda.get("granted") and autom.get("granted")),
     }
 
-# Whitelist: pane name -> x-apple.systempreferences URL
-_SETTINGS_PANES = {
-    "fda": "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
-    "automation": "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
+# Whitelist: pane name -> x-apple.systempreferences URL.
+# IMPORTANT: this dict is the SINGLE source of truth for both the Permissions
+# card (Agent 1) and the System Health Quick-Check card (Agent 2) — they used
+# to define separate _SETTINGS_PANES dicts, and the second one silently wiped
+# the first at module-load time, which is why "Open System Settings → Full
+# Disk Access" did nothing for the user. Both code paths now look up here.
+_PERM_SETTINGS_PANES = {
+    "fda":         "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+    "automation":  "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
+    "filevault":   "x-apple.systempreferences:com.apple.preference.security?FileVault",
+    "gatekeeper":  "x-apple.systempreferences:com.apple.preference.security",
+    "firewall":    "x-apple.systempreferences:com.apple.preference.security",
+    "auto_update": "x-apple.systempreferences:com.apple.preferences.softwareupdate",
+    "sw_update":   "x-apple.systempreferences:com.apple.preferences.softwareupdate",
 }
 
-def act_open_settings(pane):
-    if pane not in _SETTINGS_PANES:
-        return {"ok": False, "msg": f"unknown pane: {pane}"}
+def _open_settings_url(url, friendly):
+    """Open a System Settings deep-link and force the app to the foreground.
+    On macOS 13+ the URL alone sometimes opens System Settings behind other
+    windows, which is why the user thought 'nothing happened'. Activating via
+    osascript guarantees it pops to front."""
     try:
-        subprocess.Popen(["open", _SETTINGS_PANES[pane]])
-        return {"ok": True, "msg": f"Opened System Settings: {pane}"}
+        subprocess.Popen(["open", url])
     except Exception as e:
-        return {"ok": False, "msg": str(e)}
+        return {"ok": False, "msg": f"open failed: {e}"}
+    # Best-effort: force System Settings (or System Preferences on legacy
+    # systems) to the front. Ignore errors — the URL still worked.
+    try:
+        subprocess.Popen(["osascript", "-e",
+                          'tell application "System Settings" to activate'],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    return {"ok": True, "msg": f"Opened System Settings → {friendly}. If you don't see it, check Mission Control."}
+
+def act_open_settings(pane):
+    """Permissions card variant — same backend as the Quick-Check version."""
+    if pane not in _PERM_SETTINGS_PANES:
+        return {"ok": False, "msg": f"unknown pane: {pane}"}
+    friendly = {"fda": "Full Disk Access", "automation": "Automation"}.get(pane, pane)
+    return _open_settings_url(_PERM_SETTINGS_PANES[pane], friendly)
 # ─── END PERMISSIONS / ONBOARDING ────────────────────────────────────────────
 
 def get_disk_hogs():
@@ -2582,24 +2831,16 @@ def get_quickcheck():
         "snapshots": get_tm_snapshots(),
     }
 
-# Settings pane whitelist — strict. Values are macOS URL schemes.
-_SETTINGS_PANES = {
-    "filevault":   "x-apple.systempreferences:com.apple.preference.security?FileVault",
-    "gatekeeper":  "x-apple.systempreferences:com.apple.preference.security",
-    "firewall":    "x-apple.systempreferences:com.apple.preference.security",
-    "auto_update": "x-apple.systempreferences:com.apple.preferences.softwareupdate",
-    "sw_update":   "x-apple.systempreferences:com.apple.preferences.softwareupdate",
-}
-
+# NOTE: this function shares the _PERM_SETTINGS_PANES whitelist defined near
+# get_permissions_status() above. The two used to define separate dicts which
+# silently overwrote each other at module-load time, breaking the FDA button.
 def act_open_settings_pane(pane):
-    url = _SETTINGS_PANES.get(pane)
-    if not url:
+    if pane not in _PERM_SETTINGS_PANES:
         return {"ok": False, "msg": f"unknown pane: {pane}"}
-    try:
-        subprocess.Popen(["open", url])
-        return {"ok": True, "msg": f"Opened {pane} settings"}
-    except Exception as e:
-        return {"ok": False, "msg": str(e)}
+    friendly = {"filevault": "FileVault", "gatekeeper": "Gatekeeper",
+                "firewall": "Firewall", "auto_update": "Software Update",
+                "sw_update": "Software Update"}.get(pane, pane)
+    return _open_settings_url(_PERM_SETTINGS_PANES[pane], friendly)
 
 def act_delete_tm_snapshots(dates):
     if not isinstance(dates, list) or not dates:
@@ -2846,6 +3087,10 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
     <h2>🩺 Heal My Mac<span class="help-tip" title="A plain-English summary of what's wrong and what to do next. Start here.">?</span></h2>
     <div class="sub" id="heal-sub">Scanning…</div>
     <div id="heal-list"></div>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+      <button class="primary" onclick="openDiagnoseModal()">Why is my Mac slow right now?</button>
+      <span class="path" style="margin-left:10px;font-size:11px">Pinpoints the single root cause + the exact fix.</span>
+    </div>
   </div>
 
   <div class="card" id="permissions-card" style="display:none">
@@ -3067,6 +3312,18 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
     <div class="story-footer">
       <button class="story-reset" onclick="resetStorySession()">Reset session</button>
       <button class="primary" onclick="storyTakeSnapshot(this)">Take a fresh snapshot</button>
+    </div>
+  </div>
+</div>
+
+<div id="diagnose-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeDiagnoseModal()">
+  <div class="modal" role="dialog" aria-modal="true">
+    <button class="modal-close" onclick="closeDiagnoseModal()" aria-label="Close">×</button>
+    <h2>Why is my Mac slow right now?</h2>
+    <div id="diagnose-body">Diagnosing…</div>
+    <div class="story-footer">
+      <span class="path" style="font-size:11px">Re-runs every time you open this — current data only.</span>
+      <button class="primary" onclick="openDiagnoseModal()">Re-run diagnosis</button>
     </div>
   </div>
 </div>
@@ -3894,9 +4151,19 @@ async function loadPermissions(){
   }catch(e){ /* non-fatal */ }
 }
 async function openPermsSettingsPane(pane, btn){
-  if(btn){ btn.disabled = true; const o = btn.textContent; btn.textContent = 'Opening…';
-           setTimeout(()=>{ btn.disabled=false; btn.textContent=o; }, 2000); }
-  try{ await api('/api/open-settings', {pane: pane}); }catch(e){}
+  const orig = btn ? btn.textContent : '';
+  if(btn){ btn.disabled = true; btn.textContent = 'Opening…'; }
+  try{
+    const r = await api('/api/open-settings', {pane: pane});
+    toast(r.msg, r.ok);
+    if(btn){
+      btn.textContent = r.ok ? '✓ Opened' : 'Failed — try manually';
+      setTimeout(()=>{ btn.disabled=false; btn.textContent=orig; }, 3500);
+    }
+  }catch(e){
+    toast('Could not reach the server', false);
+    if(btn){ btn.disabled=false; btn.textContent=orig; }
+  }
 }
 
 // ─── FIRST-RUN OVERLAY + PROGRESS ───
@@ -4118,6 +4385,57 @@ function storyTakeSnapshot(btn){
     renderStoryModal();
   }).catch(()=>{ btn.disabled=false; btn.textContent=orig; });
 }
+
+// ── "Why is my Mac slow?" diagnosis modal ────────────────────────────────
+async function openDiagnoseModal(){
+  const m = document.getElementById('diagnose-modal');
+  m.style.display='flex';
+  const body = document.getElementById('diagnose-body');
+  body.innerHTML = '<div class="path">Diagnosing… reading pmset, battery, processes…</div>';
+  let d;
+  try { d = await api('/api/diagnose'); }
+  catch(e){ body.innerHTML = '<div class="issue critical"><div class="msg">Could not run diagnosis</div><div class="fix">'+esc(String(e))+'</div></div>'; return; }
+  let html = '';
+  // Big headline
+  const sevClass = (d.causes && d.causes.length && d.causes[0].severity==='critical') ? 'bad'
+                 : (d.causes && d.causes.length && d.causes[0].severity==='warn') ? 'warn'
+                 : 'good';
+  html += `<div class="story-big" style="color:var(--${sevClass})">${esc(d.headline)}</div>`;
+  // One-line summary of the system state right now
+  const stateBits = [];
+  stateBits.push(`Health ${d.score}/100`);
+  stateBits.push(`CPU clock ${d.cpu_speed_limit}%`);
+  stateBits.push(d.on_ac ? 'plugged in' : 'on battery');
+  if(d.battery && d.battery.cycle_count) stateBits.push(d.battery.cycle_count + ' battery cycles');
+  if(d.battery && d.battery.condition) stateBits.push('battery: ' + d.battery.condition);
+  html += '<div class="path" style="margin:-8px 0 14px;font-size:11px">'+esc(stateBits.join(' · '))+'</div>';
+  // Each cause as an issue card
+  if(d.causes && d.causes.length){
+    html += '<div class="story-section"><h3>Root causes (most likely first)</h3>';
+    for(const c of d.causes){
+      const cls = c.severity==='critical' ? 'critical' : (c.severity==='warn' ? 'warn' : 'info');
+      html += `<div class="issue ${cls}" style="margin-bottom:10px">
+        <div class="msg">${esc(c.title)}</div>
+        <div class="fix" style="margin-top:6px"><b>What to do:</b> ${esc(c.fix)}</div>`;
+      if(c.evidence && c.evidence.length){
+        html += '<div class="path" style="margin-top:6px;font-size:10px">Evidence: '+c.evidence.filter(e=>e).map(e=>esc(e)).join(' · ')+'</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  } else {
+    html += '<div class="issue info"><div class="msg">No active slowdown root causes detected.</div><div class="fix">Your Mac is performing within normal limits right now.</div></div>';
+  }
+  body.innerHTML = html;
+}
+function closeDiagnoseModal(){
+  document.getElementById('diagnose-modal').style.display='none';
+}
+document.addEventListener('keydown', e=>{
+  if(e.key==='Escape' && document.getElementById('diagnose-modal').style.display==='flex'){
+    closeDiagnoseModal();
+  }
+});
 async function loadAll(){
   document.getElementById('score').textContent='…';
   // Fire permissions check FIRST so the prompt appears before slow scans.
@@ -4209,6 +4527,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_permissions_status())
             if path == "/api/quickcheck":
                 return self._send(200, get_quickcheck())
+            if path == "/api/diagnose":
+                return self._send(200, diagnose_slowness())
             if path == "/api/organizer":
                 return self._send(200, get_file_organizer())
             if path == "/api/organizer-drill":
