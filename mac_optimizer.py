@@ -216,6 +216,53 @@ def get_processes():
             pass
     return rows
 
+def get_top_memory_consumers(top=10):
+    """Top RSS consumers, grouped by binary name so all the Chrome helpers
+    collapse into one 'Google Chrome (12 processes)' row totalling their
+    combined RAM. This is the 'who is eating my memory?' view — distinct
+    from get_processes() which sorts by CPU."""
+    out = sh("ps -axm -o pid,rss,comm")
+    by_name = {}  # name -> {"rss_mb": total, "count": N, "pids": [...], "path": ..., "biggest_pid": int}
+    for line in out.splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            rss_kb = int(parts[1])
+        except ValueError:
+            continue
+        full_path = parts[2]
+        # Group by basename — every "Google Chrome Helper (Renderer)" still
+        # gets attributed to the parent app the user recognises.
+        base = Path(full_path).name
+        if base in ("Google Chrome Helper", "Google Chrome Helper (Renderer)",
+                    "Google Chrome Helper (GPU)", "Google Chrome Helper (Plugin)"):
+            base = "Google Chrome (incl. tabs)"
+        elif base.startswith("Microsoft Edge"):
+            base = "Microsoft Edge (incl. tabs)"
+        elif base in ("Safari Web Content", "com.apple.WebKit.WebContent"):
+            base = "Safari (incl. tabs)"
+        if base not in by_name:
+            by_name[base] = {"name": base, "rss_mb": 0, "count": 0,
+                             "pids": [], "biggest_pid": pid, "biggest_rss": 0,
+                             "path": full_path}
+        by_name[base]["rss_mb"] += rss_kb / 1024
+        by_name[base]["count"] += 1
+        by_name[base]["pids"].append(pid)
+        if rss_kb > by_name[base]["biggest_rss"]:
+            by_name[base]["biggest_rss"] = rss_kb
+            by_name[base]["biggest_pid"] = pid
+    rows = sorted(by_name.values(), key=lambda x: -x["rss_mb"])[:top]
+    return [{
+        "name": r["name"],
+        "rss_mb": round(r["rss_mb"]),
+        "rss_human": (f"{r['rss_mb']/1024:.1f} GB" if r["rss_mb"] >= 1024
+                      else f"{r['rss_mb']:.0f} MB"),
+        "process_count": r["count"],
+        "biggest_pid": r["biggest_pid"],
+    } for r in rows if r["rss_mb"] >= 50]  # hide noise under 50 MB
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Process intelligence — what each process is, in plain English
 # ─────────────────────────────────────────────────────────────────────────────
@@ -655,26 +702,54 @@ def diagnose_slowness():
                 "confidence": "medium",
             })
 
-    # 2. Memory pressure
+    # 2. Memory pressure — find the actual top RSS consumer (grouped by app),
+    # not just the top one in the CPU-sorted list. On modern Macs the worst
+    # memory hogs (browser tabs, AI CLIs) are rarely the top CPU users.
+    mem_hogs = get_top_memory_consumers(top=5)
+    top_hog = mem_hogs[0] if mem_hogs else None
     if h["swap_used_mb"] > 1500 and h["mem_free_pct"] < 30:
-        top_mem = max(procs, key=lambda p: p.get("rss_mb",0)) if procs else {}
+        evidence = [
+            f"swap used: {h['swap_used_mb']:.0f} MB",
+            f"free memory: {h['mem_free_pct']}%",
+            f"wired memory: {h['wired_gb']:.1f} GB",
+        ]
+        if top_hog:
+            count_part = f" across {top_hog['process_count']} processes" if top_hog['process_count'] > 1 else ""
+            evidence.append(f"#1 memory hog: {top_hog['name']} ({top_hog['rss_human']}{count_part})")
         causes.append({
             "severity": "critical",
             "title": "RAM exhausted — macOS is paging to disk (this is what beach-balling feels like)",
-            "evidence": [
-                f"swap used: {h['swap_used_mb']:.0f} MB",
-                f"free memory: {h['mem_free_pct']}%",
-                f"biggest memory user: {top_mem.get('name','?')} ({top_mem.get('rss_mb',0):.0f} MB)" if top_mem else "",
-            ],
-            "fix": f"Quit {top_mem.get('name','the biggest memory hog')} from Process Inspector, then close idle browser tabs.",
+            "evidence": evidence,
+            "fix": (f"Quit {top_hog['name']} first — that frees ~{top_hog['rss_human']} of RAM and stops the swapping."
+                    if top_hog else
+                    "Quit the biggest memory hog from Process Inspector."),
             "confidence": "high",
         })
+        # If swap is huge AND elapsed since last clear is unknowable, suggest
+        # a reboot — only reboot zeros existing swap entries.
+        if h["swap_used_mb"] > 3000:
+            causes.append({
+                "severity": "warn",
+                "title": "Swap is sticky — only a reboot fully clears it",
+                "evidence": [
+                    f"swap on disk: {h['swap_used_mb']:.0f} MB",
+                    "swap entries don't shrink even after you free RAM",
+                    "they stay until owning processes exit OR you reboot",
+                ],
+                "fix": "Save your work, quit your apps, then full shutdown for 30 seconds and power back on. Wired memory and swap both go to zero.",
+                "confidence": "high",
+            })
     elif h["swap_used_mb"] > 500:
+        ev = [f"swap used: {h['swap_used_mb']:.0f} MB", f"free memory: {h['mem_free_pct']}%"]
+        if top_hog:
+            ev.append(f"#1 memory hog: {top_hog['name']} ({top_hog['rss_human']})")
         causes.append({
             "severity": "info",
             "title": "Mild memory pressure — some swapping happening",
-            "evidence": [f"swap used: {h['swap_used_mb']:.0f} MB", f"free memory: {h['mem_free_pct']}%"],
-            "fix": "Not urgent yet. Quit apps you're not using if it grows.",
+            "evidence": ev,
+            "fix": (f"Not urgent yet. If it grows, quit {top_hog['name']} first."
+                    if top_hog else
+                    "Not urgent yet. Quit apps you're not using if it grows."),
             "confidence": "medium",
         })
 
@@ -3136,6 +3211,16 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
 
 <div class="grid">
 
+  <div class="card" id="memhogs-card">
+    <h2>Memory Hogs<span class="help-tip" title="Apps using the most RAM right now, grouped by app (so all the Chrome tabs collapse into one row). Quit the top one to free swap pressure fastest.">?</span> <span class="count" id="memhogs-count"></span></h2>
+    <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
+      Sorted by RAM, not CPU. Browser tabs are grouped together so you see the real total.
+      Click <b>Kill</b> on the biggest one to free RAM and stop new swapping immediately.
+      Existing swap-on-disk only clears with a reboot.
+    </p>
+    <div id="memhogs-list"></div>
+  </div>
+
   <div class="card heal" id="heal-card">
     <h2>🩺 Heal My Mac<span class="help-tip" title="A plain-English summary of what's wrong and what to do next. Start here.">?</span></h2>
     <div class="sub" id="heal-sub">Scanning…</div>
@@ -4441,6 +4526,38 @@ function storyTakeSnapshot(btn){
   }).catch(()=>{ btn.disabled=false; btn.textContent=orig; });
 }
 
+// ── Memory Hogs panel ─────────────────────────────────────────────────────
+async function loadMemoryHogs(){
+  let h;
+  try { h = await api('/api/memory-hogs'); } catch(e){ return; }
+  const list = document.getElementById('memhogs-list');
+  const countEl = document.getElementById('memhogs-count');
+  if(!h || !h.length){
+    list.innerHTML = '<div class="path">no significant memory consumers</div>';
+    if(countEl) countEl.textContent = 'all calm';
+    return;
+  }
+  if(countEl) countEl.textContent = h.length+' apps';
+  list.innerHTML = h.map((m,i)=>{
+    const isTop = i === 0;
+    const tagCls = m.rss_mb >= 1024 ? 'bad' : (m.rss_mb >= 500 ? 'warn' : 'good');
+    const procPart = m.process_count > 1 ? ' · '+m.process_count+' processes' : '';
+    return `<div class="proc">
+      <div class="left">
+        <div class="friendly">
+          ${esc(m.name)}
+          <span class="tag ${tagCls}">${esc(m.rss_human)}</span>
+          ${isTop ? '<span class="tag bad">#1 hog</span>' : ''}
+        </div>
+        <div class="raw">PID ${m.biggest_pid}${procPart}</div>
+      </div>
+      <div class="btn-row">
+        <button class="danger btn-sm" onclick='killProc(this,${m.biggest_pid},${JSON.stringify(m.name)},${JSON.stringify("Frees ~"+m.rss_human+" of RAM. "+(m.process_count>1?"This is the largest of "+m.process_count+" processes for "+m.name+".":""))})'>Kill</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
 // ── "Why is my Mac slow?" diagnosis modal ────────────────────────────────
 async function openDiagnoseModal(){
   const m = document.getElementById('diagnose-modal');
@@ -4507,7 +4624,7 @@ async function loadAll(){
   const loaders = [loadHealth,loadHeal,loadIntel,loadDisk,loadUnused,loadLarge,
                    loadSec,loadThreats,loadNetwork,loadHistory,
                    loadVendors,loadOrphans,loadStale,loadQuickCheck,
-                   loadOrganizer,loadDuplicates];
+                   loadOrganizer,loadDuplicates,loadMemoryHogs];
   const overlay = _showFirstRunOverlay(loaders.length);
   const wrapped = loaders.map(fn => Promise.resolve().then(fn).finally(()=>{
     if(overlay) overlay.tick();
@@ -4593,6 +4710,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_quickcheck())
             if path == "/api/diagnose":
                 return self._send(200, diagnose_slowness())
+            if path == "/api/memory-hogs":
+                return self._send(200, get_top_memory_consumers())
             if path == "/api/organizer":
                 return self._send(200, get_file_organizer())
             if path == "/api/organizer-drill":
