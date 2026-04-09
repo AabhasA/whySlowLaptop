@@ -2087,6 +2087,194 @@ def act_remove_login_item(name):
     return {"ok": True, "msg": f"Removed login item: {name}"}
 
 # ─────────────────────────────────────────────────────────────────────────────
+# System Health Quick-Check (Time Machine snapshots, SW updates, security posture)
+# ─────────────────────────────────────────────────────────────────────────────
+_TM_SNAPSHOT_RE = re.compile(r"(\d{4}-\d{2}-\d{2}-\d{6})")
+_TM_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}$")
+
+def _parse_purgeable():
+    """Best-effort: return a human string for purgeable/reclaimable space on /, or None."""
+    # Try diskutil apfs list first
+    out = sh("diskutil apfs list /", timeout=8)
+    if out and not out.startswith("ERR"):
+        for line in out.splitlines():
+            low = line.lower()
+            if "purgeable" in low:
+                m = re.search(r"([\d.]+\s*[KMGT]?B)", line)
+                if m:
+                    return m.group(1).strip()
+    # Fallback: df -h / doesn't show purgeable, but try anyway
+    return None
+
+def get_tm_snapshots():
+    """List Time Machine local snapshots on /. Returns count, optional purgeable
+    size, and parsed snapshot dates. Aby's rule: caller hides UI if count==0."""
+    out = sh("tmutil listlocalsnapshots /", timeout=10)
+    snapshots = []
+    if out and not out.startswith("ERR"):
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = _TM_SNAPSHOT_RE.search(line)
+            if m:
+                snapshots.append({"date": m.group(1), "raw": line})
+    return {
+        "count": len(snapshots),
+        "purgeable_human": _parse_purgeable(),
+        "snapshots": snapshots,
+    }
+
+_SWUPDATE_CACHE = {"data": None, "ts": 0}
+_SWUPDATE_CACHE_TTL = 1800  # 30 minutes
+
+def get_software_updates():
+    """Parse `softwareupdate -l`. Slow (hits Apple servers) — cached 30 min.
+    Severity: contains 'Security' => critical, [Recommended] => warn, else info."""
+    now = time.time()
+    if _SWUPDATE_CACHE["data"] is not None and (now - _SWUPDATE_CACHE["ts"]) < _SWUPDATE_CACHE_TTL:
+        return _SWUPDATE_CACHE["data"]
+    out = sh("softwareupdate -l 2>&1", timeout=60)
+    items = []
+    if out and not out.startswith("ERR"):
+        lines = out.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            m = re.match(r"^\s*\*\s*(?:Label:\s*)?(.+?)\s*$", line)
+            if m and "No new software" not in line and "Software Update Tool" not in line:
+                label = m.group(1).strip()
+                title = label
+                # Look at next line for Title:
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1]
+                    tm = re.search(r"Title:\s*(.+?)(?:,\s*Version|,\s*Size|$)", nxt)
+                    if tm:
+                        title = tm.group(1).strip()
+                recommended = "[Recommended]" in (lines[i] + (lines[i+1] if i+1 < len(lines) else ""))
+                is_security = "security" in title.lower() or "security" in label.lower()
+                if is_security:
+                    sev = "critical"
+                elif recommended:
+                    sev = "warn"
+                else:
+                    sev = "info"
+                items.append({"label": label, "title": title, "severity": sev})
+            i += 1
+    data = {
+        "count": len(items),
+        "critical_count": sum(1 for x in items if x["severity"] == "critical"),
+        "items": items,
+    }
+    _SWUPDATE_CACHE["data"] = data
+    _SWUPDATE_CACHE["ts"] = now
+    return data
+
+def _posture_state(val):
+    return "on" if val is True else ("off" if val is False else "unknown")
+
+def get_security_posture():
+    """Read-only check of five security toggles. Never changes anything."""
+    # FileVault
+    fv = sh("fdesetup status", timeout=5)
+    if fv.startswith("ERR"):
+        filevault = "unknown"
+    else:
+        filevault = _posture_state("FileVault is On" in fv)
+
+    # Gatekeeper
+    gk = sh("spctl --status 2>&1", timeout=5)
+    if gk.startswith("ERR"):
+        gatekeeper = "unknown"
+    else:
+        gatekeeper = _posture_state("assessments enabled" in gk)
+
+    # SIP
+    sipo = sh("csrutil status", timeout=5)
+    if sipo.startswith("ERR"):
+        sip = "unknown"
+    else:
+        sip = _posture_state("enabled" in sipo.lower() and "disabled" not in sipo.lower())
+
+    # Firewall (no sudo via defaults read)
+    fw_raw = sh("defaults read /Library/Preferences/com.apple.alf globalstate 2>&1", timeout=5)
+    firewall = "unknown"
+    try:
+        fw_int = int(fw_raw.strip())
+        firewall = "on" if fw_int >= 1 else "off"
+    except Exception:
+        # Fallback to socketfilterfw
+        fw2 = sh("/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>&1", timeout=5)
+        if not fw2.startswith("ERR"):
+            if "enabled" in fw2.lower():
+                firewall = "on"
+            elif "disabled" in fw2.lower():
+                firewall = "off"
+
+    # Auto-update
+    au_raw = sh("defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>&1", timeout=5)
+    auto_update = "unknown"
+    try:
+        auto_update = "on" if int(au_raw.strip()) == 1 else "off"
+    except Exception:
+        pass
+
+    score = sum(1 for v in (filevault, gatekeeper, sip, firewall, auto_update) if v == "on")
+    return {
+        "filevault": filevault,
+        "gatekeeper": gatekeeper,
+        "sip": sip,
+        "firewall": firewall,
+        "auto_update": auto_update,
+        "score": score,
+    }
+
+def get_quickcheck():
+    return {
+        "posture": get_security_posture(),
+        "updates": get_software_updates(),
+        "snapshots": get_tm_snapshots(),
+    }
+
+# Settings pane whitelist — strict. Values are macOS URL schemes.
+_SETTINGS_PANES = {
+    "filevault":   "x-apple.systempreferences:com.apple.preference.security?FileVault",
+    "gatekeeper":  "x-apple.systempreferences:com.apple.preference.security",
+    "firewall":    "x-apple.systempreferences:com.apple.preference.security",
+    "auto_update": "x-apple.systempreferences:com.apple.preferences.softwareupdate",
+    "sw_update":   "x-apple.systempreferences:com.apple.preferences.softwareupdate",
+}
+
+def act_open_settings_pane(pane):
+    url = _SETTINGS_PANES.get(pane)
+    if not url:
+        return {"ok": False, "msg": f"unknown pane: {pane}"}
+    try:
+        subprocess.Popen(["open", url])
+        return {"ok": True, "msg": f"Opened {pane} settings"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+def act_delete_tm_snapshots(dates):
+    if not isinstance(dates, list) or not dates:
+        return {"ok": False, "msg": "no snapshot dates provided"}
+    valid = [d for d in dates if isinstance(d, str) and _TM_DATE_RE.match(d)]
+    if not valid:
+        return {"ok": False, "msg": "no valid snapshot dates (expected YYYY-MM-DD-HHMMSS)"}
+    # Build a single shell script that deletes each one. tmutil deletelocalsnapshots
+    # accepts the date portion. Run whole thing under one admin prompt.
+    cmds = " && ".join(f"/usr/bin/tmutil deletelocalsnapshots {shlex.quote(d)}" for d in valid)
+    script = f'do shell script "{cmds}" with administrator privileges'
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True,
+                           text=True, timeout=120)
+        if r.returncode == 0:
+            return {"ok": True, "msg": f"Deleted {len(valid)} snapshot(s)"}
+        return {"ok": False, "msg": (r.stderr or r.stdout or "osascript failed").strip()}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HTTP server
 # ─────────────────────────────────────────────────────────────────────────────
 HTML = r"""<!doctype html>
@@ -2284,6 +2472,29 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
       The verdict tag tells you whether killing is safe.
     </p>
     <div id="intel-list"></div>
+  </div>
+
+  <div class="card" id="quickcheck-card">
+    <h2>System Health Quick-Check <span class="count" id="qc-score"></span></h2>
+    <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
+      Three things every Mac should have squared away: security toggles, pending updates, and Time Machine snapshots eating disk.
+    </p>
+    <div id="qc-posture" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px"></div>
+    <div id="qc-updates-section" style="display:none;margin-top:8px;padding-top:12px;border-top:1px solid #1f2530">
+      <h3 style="font-size:12px;color:var(--dim);margin:0 0 8px">Pending software updates <span id="qc-updates-count"></span></h3>
+      <div id="qc-updates-list"></div>
+      <div class="btn-row" style="margin-top:8px">
+        <button onclick='openSettingsPane(this,"sw_update")'>Open Software Update settings</button>
+      </div>
+    </div>
+    <div id="qc-tm-section" style="display:none;margin-top:8px;padding-top:12px;border-top:1px solid #1f2530">
+      <h3 style="font-size:12px;color:var(--dim);margin:0 0 8px">Time Machine local snapshots</h3>
+      <div id="qc-tm-summary" class="path"></div>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="danger" onclick="deleteAllTmSnapshots(this)">Delete all snapshots</button>
+      </div>
+    </div>
+    <div id="qc-allgood" style="display:none;color:var(--good);font-size:12px;margin-top:6px">All clear. Nothing to fix here.</div>
   </div>
 
   <div class="card">
@@ -2983,20 +3194,20 @@ async function loadPermissions(){
       items.push(`<div class="issue critical">
         <div class="msg">Full Disk Access missing</div>
         <div class="fix">Without Full Disk Access I can't see how much space your Mail and Safari are using — your scan will be incomplete.</div>
-        <div style="margin-top:8px"><button class="danger" onclick="openSettingsPane('fda', this)">Open System Settings → Full Disk Access</button></div>
+        <div style="margin-top:8px"><button class="danger" onclick="openPermsSettingsPane('fda', this)">Open System Settings → Full Disk Access</button></div>
       </div>`);
     }
     if(!p.automation || !p.automation.granted){
       items.push(`<div class="issue critical">
         <div class="msg">Automation (System Events) missing</div>
         <div class="fix">Without Automation I can't ask macOS which apps are actually running — some panels will be empty.</div>
-        <div style="margin-top:8px"><button class="danger" onclick="openSettingsPane('automation', this)">Open System Settings → Automation</button></div>
+        <div style="margin-top:8px"><button class="danger" onclick="openPermsSettingsPane('automation', this)">Open System Settings → Automation</button></div>
       </div>`);
     }
     list.innerHTML = items.join('');
   }catch(e){ /* non-fatal */ }
 }
-async function openSettingsPane(pane, btn){
+async function openPermsSettingsPane(pane, btn){
   if(btn){ btn.disabled = true; const o = btn.textContent; btn.textContent = 'Opening…';
            setTimeout(()=>{ btn.disabled=false; btn.textContent=o; }, 2000); }
   try{ await api('/api/open-settings', {pane: pane}); }catch(e){}
@@ -3029,13 +3240,86 @@ function _showFirstRunOverlay(total){
   };
 }
 
+// ─── System Health Quick-Check ────────────────────────────────────────────
+function openSettingsPane(btn, pane){
+  _runAction(btn, 'Opening…', '/api/open-settings-pane', {pane:pane});
+}
+function deleteAllTmSnapshots(btn){
+  const dates = (window._qcTmDates||[]);
+  if(!dates.length){ toast('No snapshots to delete', false); return; }
+  _runAction(btn, 'Deleting…', '/api/delete-tm-snapshots', {dates:dates},
+    'Delete '+dates.length+' Time Machine local snapshot(s)? Admin password required.');
+}
+async function loadQuickCheck(){
+  let q;
+  try { q = await api('/api/quickcheck'); } catch(e){ return; }
+  const p = q.posture||{}, u = q.updates||{}, s = q.snapshots||{};
+
+  // Score badge
+  const scoreEl = document.getElementById('qc-score');
+  scoreEl.textContent = (p.score||0) + '/5';
+
+  // Posture pills
+  const labels = {filevault:'FileVault', gatekeeper:'Gatekeeper', sip:'SIP',
+                  firewall:'Firewall', auto_update:'Auto-Update'};
+  const paneMap = {filevault:'filevault', gatekeeper:'gatekeeper', sip:null,
+                   firewall:'firewall', auto_update:'auto_update'};
+  const order = ['filevault','gatekeeper','sip','firewall','auto_update'];
+  const pp = document.getElementById('qc-posture');
+  pp.innerHTML = order.map(k=>{
+    const v = p[k]||'unknown';
+    const cls = v==='on'?'good':(v==='off'?'bad':'warn');
+    const pane = paneMap[k];
+    const clickable = (v!=='on' && pane);
+    const onclk = clickable ? `onclick='openSettingsPane(this,${JSON.stringify(pane)})'` : '';
+    const cursor = clickable ? 'cursor:pointer;' : '';
+    const title = clickable ? `title="Click to open ${labels[k]} settings"` : '';
+    return `<span class="tag ${cls}" style="padding:4px 10px;font-size:11px;${cursor}" ${title} ${onclk}>${labels[k]}: ${v}</span>`;
+  }).join('');
+
+  // Updates section — hide if 0
+  const usec = document.getElementById('qc-updates-section');
+  if((u.count||0) > 0){
+    usec.style.display='';
+    document.getElementById('qc-updates-count').textContent =
+      '('+u.count+(u.critical_count?', '+u.critical_count+' security':'')+')';
+    const list = document.getElementById('qc-updates-list');
+    list.innerHTML = (u.items||[]).map(it=>{
+      const cls = it.severity==='critical'?'bad':(it.severity==='warn'?'warn':'good');
+      return `<div style="padding:4px 0;font-size:12px">
+        <span class="tag ${cls}">${esc(it.severity)}</span>
+        ${esc(it.title)} <span class="path">${esc(it.label)}</span></div>`;
+    }).join('') || '<div class="path">No details parsed.</div>';
+  } else {
+    usec.style.display='none';
+  }
+
+  // Time Machine section — hide if 0
+  const tsec = document.getElementById('qc-tm-section');
+  if((s.count||0) > 0){
+    tsec.style.display='';
+    const sum = 'Local snapshots: '+s.count+
+      (s.purgeable_human ? ' · purgeable: '+s.purgeable_human
+                         : ' · size hidden by macOS — use Storage Settings to see exact reclaimable amount.');
+    document.getElementById('qc-tm-summary').textContent = sum;
+    window._qcTmDates = (s.snapshots||[]).map(x=>x.date);
+  } else {
+    tsec.style.display='none';
+    window._qcTmDates = [];
+  }
+
+  // All-green hint
+  const allGood = (p.score===5) && (u.count||0)===0 && (s.count||0)===0;
+  document.getElementById('qc-allgood').style.display = allGood ? '' : 'none';
+}
+
 async function loadAll(){
   document.getElementById('score').textContent='…';
   // Fire permissions check FIRST so the prompt appears before slow scans.
   loadPermissions();
   const loaders = [loadHealth,loadHeal,loadIntel,loadDisk,loadUnused,loadLarge,
                    loadSec,loadThreats,loadNetwork,loadHistory,
-                   loadVendors,loadOrphans,loadStale];
+                   loadVendors,loadOrphans,loadStale,loadQuickCheck];
   const overlay = _showFirstRunOverlay(loaders.length);
   const wrapped = loaders.map(fn => Promise.resolve().then(fn).finally(()=>{
     if(overlay) overlay.tick();
@@ -3106,6 +3390,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_stale_files())
             if path == "/api/permissions":
                 return self._send(200, get_permissions_status())
+            if path == "/api/quickcheck":
+                return self._send(200, get_quickcheck())
             if path == "/api/vendor-footprint":
                 vendor = urlparse(self.path).query
                 # Parse ?vendor=adobe
@@ -3148,6 +3434,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, act_reveal_path(body.get("path")))
             if path == "/api/open-settings":
                 return self._send(200, act_open_settings(body.get("pane")))
+            if path == "/api/open-settings-pane":
+                return self._send(200, act_open_settings_pane(body.get("pane")))
+            if path == "/api/delete-tm-snapshots":
+                return self._send(200, act_delete_tm_snapshots(body.get("dates") or []))
             return self._send(404, {"ok": False, "msg": "unknown action"})
         except Exception as e:
             return self._send(500, {"ok": False, "msg": str(e)})
@@ -3190,6 +3480,9 @@ def main():
     # ~/Documents can take 20-30 seconds, and we don't want the first page
     # load to block on it. By the time the user clicks around, it's ready.
     threading.Thread(target=get_stale_files, daemon=True).start()
+    # Pre-warm software updates cache — `softwareupdate -l` hits Apple servers
+    # and can take 10-30 seconds, so we do it off the first request path.
+    threading.Thread(target=get_software_updates, daemon=True).start()
     url = f"http://localhost:{PORT}"
     print(f"\n🔧 Mac Optimizer running at {url}")
     if "--watch" in args:
