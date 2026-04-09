@@ -139,9 +139,13 @@ def get_health():
     score = 100
     if speed_limit < 100:
         sev = 30 if speed_limit < 50 else 15
+        # Don't guess the cause here — diagnose_slowness() inspects battery
+        # cycles, AC state, charger wattage, and top processes to figure out
+        # whether it's thermal, power, charger, or worn battery. The Heal
+        # banner reuses that diagnosis. Keep this short + point at the button.
         issues.append({"sev": "critical" if speed_limit < 50 else "warn",
-                       "msg": f"CPU throttled to {speed_limit}% — thermal/power issue",
-                       "fix": "Full shutdown (not restart) for 60s. Try original Apple charger plugged directly into wall, no hub."})
+                       "msg": f"CPU clock limited to {speed_limit}% of normal",
+                       "fix": "Click 'Why is my Mac slow right now?' in the Heal banner — it pinpoints whether it's battery, charger, or heat."})
         score -= sev
     if disk_used_pct > 90:
         issues.append({"sev": "critical", "msg": f"Disk {disk_used_pct}% full — APFS slows below 10% free",
@@ -772,14 +776,31 @@ def get_heal_recommendations():
             "action_label": None,
         })
 
-    # 7. CPU thermal throttling
+    # 7. CPU throttled — pull the actual root cause from the diagnose function
+    # so the Heal banner doesn't show a stale "too hot or charger" message
+    # when the real reason is a worn battery, underpowered charger, etc.
+    # This used to be a hardcoded thermal message that confused users on
+    # battery power with degraded batteries (Aby's case: 917 cycles, no AC).
     if h["speed_limit"] < 100:
-        recs.append({
-            "severity": "critical",
-            "title": f"Mac is thermally throttled to {h['speed_limit']}% speed",
-            "why": "The Mac is too hot or the charger isn't delivering enough power. Plug into the wall directly (no hub), give the Mac airflow, and consider getting the fans cleaned if this is persistent.",
-            "action_label": None,
-        })
+        try:
+            diag = diagnose_slowness()
+            top_cause = diag["causes"][0] if diag.get("causes") else None
+        except Exception:
+            top_cause = None
+        if top_cause:
+            recs.append({
+                "severity": "critical" if top_cause["severity"] == "critical" else "warn",
+                "title": f"CPU throttled to {h['speed_limit']}% — {top_cause['title']}",
+                "why": top_cause["fix"],
+                "action_label": None,
+            })
+        else:
+            recs.append({
+                "severity": "critical",
+                "title": f"CPU throttled to {h['speed_limit']}% speed",
+                "why": "Click 'Why is my Mac slow right now?' below for the root cause.",
+                "action_label": None,
+            })
 
     if not recs:
         recs.append({
