@@ -574,6 +574,79 @@ def get_heal_recommendations():
                    f"{len([r for r in recs if r['severity'] == 'medium'])} suggested",
     }
 
+# ─── PERMISSIONS / ONBOARDING ────────────────────────────────────────────────
+def _check_fda():
+    """Detect Full Disk Access by probing protected paths. Returns dict."""
+    mail_dir = HOME / "Library/Mail"
+    safari_hist = HOME / "Library/Safari/History.db"
+    try:
+        if mail_dir.exists():
+            try:
+                os.listdir(mail_dir)
+            except PermissionError:
+                return {"granted": False, "tested_path": str(mail_dir)}
+        if safari_hist.exists():
+            try:
+                os.stat(safari_hist)
+                return {"granted": True, "tested_path": str(safari_hist)}
+            except PermissionError:
+                return {"granted": False, "tested_path": str(safari_hist)}
+        if mail_dir.exists():
+            # Mail existed and we listed it fine
+            return {"granted": True, "tested_path": str(mail_dir)}
+        # Fallback: neither target exists — probe Safari container
+        container = HOME / "Library/Containers/com.apple.Safari"
+        if container.exists():
+            try:
+                os.listdir(container)
+                return {"granted": True, "tested_path": str(container)}
+            except PermissionError:
+                return {"granted": False, "tested_path": str(container)}
+        return {"granted": False, "tested_path": str(container)}
+    except Exception as e:
+        return {"granted": False, "tested_path": f"error: {e}"}
+
+def _check_automation():
+    """Detect Automation permission via System Events osascript probe."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to return name of first process'],
+            capture_output=True, text=True, timeout=3)
+        if r.returncode != 0:
+            return {"granted": False}
+        err = (r.stderr or "").lower()
+        if "-1743" in err or "not authorized" in err:
+            return {"granted": False}
+        return {"granted": True}
+    except Exception:
+        return {"granted": False}
+
+def get_permissions_status():
+    fda = _check_fda()
+    autom = _check_automation()
+    return {
+        "fda": fda,
+        "automation": autom,
+        "all_granted": bool(fda.get("granted") and autom.get("granted")),
+    }
+
+# Whitelist: pane name -> x-apple.systempreferences URL
+_SETTINGS_PANES = {
+    "fda": "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+    "automation": "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
+}
+
+def act_open_settings(pane):
+    if pane not in _SETTINGS_PANES:
+        return {"ok": False, "msg": f"unknown pane: {pane}"}
+    try:
+        subprocess.Popen(["open", _SETTINGS_PANES[pane]])
+        return {"ok": True, "msg": f"Opened System Settings: {pane}"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+# ─── END PERMISSIONS / ONBOARDING ────────────────────────────────────────────
+
 def get_disk_hogs():
     """Show biggest folders in user dir + cleanable items."""
     targets = [
@@ -2147,6 +2220,24 @@ button.kill-safe{background:#1a3b2a;color:var(--good);border-color:#2a5b40}
 button.kill-safe:hover{background:#2a5b40}
 button.kill-caution{background:#3b2f1a;color:var(--warn);border-color:#5b4920}
 button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:not-allowed}
+
+/* Onboarding: permissions card, first-run overlay, help tips */
+#permissions-card{grid-column:1/-1;border:1px solid #5c2630;background:linear-gradient(135deg,#2a1216,#1a0d10)}
+#permissions-card h2{color:var(--bad);text-transform:none;font-size:16px;letter-spacing:0}
+#permissions-card .perm-sub{color:var(--dim);font-size:12px;margin-bottom:12px}
+.help-tip{display:inline-block;width:15px;height:15px;line-height:15px;text-align:center;
+          border-radius:50%;background:var(--panel2);color:var(--dim);font-size:10px;
+          font-weight:700;margin-left:6px;cursor:help;font-family:sans-serif;
+          border:1px solid var(--border);text-transform:none;letter-spacing:0}
+.help-tip:hover{background:var(--accent);color:#0b0e14}
+#first-run-overlay{position:fixed;inset:0;background:rgba(6,9,14,.92);z-index:9998;
+                   display:flex;flex-direction:column;align-items:center;justify-content:center;
+                   backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+#first-run-overlay .fr-title{font-size:28px;font-weight:700;color:var(--text);margin-bottom:10px}
+#first-run-overlay .fr-sub{font-size:14px;color:var(--dim);max-width:520px;text-align:center;line-height:1.6;margin-bottom:26px;padding:0 20px}
+#first-run-overlay .fr-bar{width:360px;height:10px;background:#1b2230;border-radius:5px;overflow:hidden;border:1px solid var(--border)}
+#first-run-overlay .fr-bar-fill{height:100%;background:var(--accent);width:0%;transition:width .4s ease}
+#first-run-overlay .fr-count{margin-top:10px;font-size:11px;color:var(--dim);font-family:ui-monospace,Menlo,monospace}
 </style>
 </head><body>
 <header>
@@ -2157,22 +2248,36 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 </header>
 
+<div id="first-run-overlay" style="display:none">
+  <div class="fr-title">Scanning your Mac…</div>
+  <div class="fr-sub">First scan takes 60–90 seconds because we're reading every folder in your home directory. After this, refreshes are instant.</div>
+  <div class="fr-bar"><div class="fr-bar-fill" id="fr-bar-fill"></div></div>
+  <div class="fr-count" id="fr-count">0 / 13</div>
+</div>
+
 <div class="grid">
 
   <div class="card heal" id="heal-card">
-    <h2>🩺 Heal My Mac</h2>
+    <h2>🩺 Heal My Mac<span class="help-tip" title="A plain-English summary of what's wrong and what to do next. Start here.">?</span></h2>
     <div class="sub" id="heal-sub">Scanning…</div>
     <div id="heal-list"></div>
   </div>
 
+  <div class="card" id="permissions-card" style="display:none">
+    <h2>Permissions Needed<span class="help-tip" title="macOS won't let this dashboard see some files until you grant permission. Click the buttons below to open System Settings.">?</span></h2>
+    <div class="perm-sub">macOS needs your OK before this dashboard can see some things. Grant these once and you're done.</div>
+    <div id="permissions-list"></div>
+    <div style="margin-top:10px"><button onclick="loadPermissions()">Re-check</button></div>
+  </div>
+
   <div class="card" id="health-card">
-    <h2>System Health <span class="count" id="health-count"></span></h2>
+    <h2>System Health<span class="help-tip" title="CPU, memory, thermal, and battery stats at a glance. Green is good, red needs attention.">?</span> <span class="count" id="health-count"></span></h2>
     <div id="health-metrics"></div>
     <div id="health-issues" style="margin-top:14px"></div>
   </div>
 
   <div class="card">
-    <h2>Process Inspector <span class="count" id="intel-count"></span></h2>
+    <h2>Process Inspector<span class="help-tip" title="Apps using a lot of CPU right now. The 'verdict' tag tells you if it's safe to kill.">?</span> <span class="count" id="intel-count"></span></h2>
     <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
       Only processes that are actually impacting your Mac are shown here. If this list is short, your Mac is calm.
       Rows with a <b style="color:#fb923c">heavy</b> or <b style="color:var(--bad)">severe</b> badge are the ones worth killing.
@@ -2182,7 +2287,7 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 
   <div class="card">
-    <h2>Disk Hogs</h2>
+    <h2>Disk Hogs<span class="help-tip" title="The biggest folders on your Mac, with notes on which are safe to clean.">?</span></h2>
     <table id="disk-table"><thead>
       <tr><th>Folder</th><th>Size</th><th>Note</th><th></th></tr>
     </thead><tbody></tbody></table>
@@ -2193,21 +2298,21 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 
   <div class="card">
-    <h2>Unused Apps (1+ year) <span class="count" id="unused-count"></span></h2>
+    <h2>Unused Apps (1+ year)<span class="help-tip" title="Apps you haven't opened in over a year. Usually safe to delete to reclaim disk space.">?</span> <span class="count" id="unused-count"></span></h2>
     <table id="unused-table"><thead>
       <tr><th>App</th><th>Last Used</th><th>Size</th><th></th></tr>
     </thead><tbody></tbody></table>
   </div>
 
   <div class="card">
-    <h2>Largest Apps</h2>
+    <h2>Largest Apps<span class="help-tip" title="Apps taking up the most disk space, so you can decide what's worth keeping.">?</span></h2>
     <table id="large-table"><thead>
       <tr><th>App</th><th>Size</th><th>Last Used</th><th></th></tr>
     </thead><tbody></tbody></table>
   </div>
 
   <div class="card">
-    <h2>Recurring Offenders <span class="count" id="off-count"></span></h2>
+    <h2>Recurring Offenders<span class="help-tip" title="Processes that keep pegging your CPU over time. If this list is empty, nothing chronic is wrong.">?</span> <span class="count" id="off-count"></span></h2>
     <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
       Processes that have repeatedly pegged ≥30% CPU across the last 30 ten-minute snapshots.
       This panel hides things you're actively using (browsers, terminals, AI CLIs) —
@@ -2219,7 +2324,7 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 
   <div class="card">
-    <h2>Threat Scan <span class="count" id="threat-count"></span></h2>
+    <h2>Threat Scan<span class="help-tip" title="Looks for unsigned processes, weird kernel extensions, modified hosts files, and other signs of trouble.">?</span> <span class="count" id="threat-count"></span></h2>
     <h3 style="font-size:12px;color:var(--dim);margin:0 0 6px">Unsigned / suspicious processes</h3>
     <table id="unsigned-table"><thead>
       <tr><th>Process</th><th>Sig</th><th>PID</th><th></th></tr>
@@ -2235,7 +2340,7 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 
   <div class="card">
-    <h2>Network Activity <span class="count" id="net-count"></span></h2>
+    <h2>Network Activity<span class="help-tip" title="Shows which apps are currently talking to the internet and to whom. Unexpected traffic means investigate.">?</span> <span class="count" id="net-count"></span></h2>
     <p style="color:var(--dim);font-size:12px;margin:0 0 10px">Established outbound TCP connections. Lots of conns from unexpected processes = investigate.</p>
     <table id="net-table"><thead>
       <tr><th>Process</th><th>PID</th><th>Conns</th><th>Sample remote</th></tr>
@@ -2243,7 +2348,7 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 
   <div class="card">
-    <h2>Browser Extensions <span class="count" id="ext-count"></span></h2>
+    <h2>Browser Extensions<span class="help-tip" title="Add-ons installed in your browsers. Risky ones (broad permissions) are flagged first.">?</span> <span class="count" id="ext-count"></span></h2>
     <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
       <b>Quit your browser before removing</b>, otherwise it will recreate the folder from sync.
       Risky extensions (broad permissions) are listed first — they can read everything you do in the browser.
@@ -2252,7 +2357,7 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 
   <div class="card">
-    <h2>Stale Files <span class="count" id="stale-count"></span></h2>
+    <h2>Stale Files<span class="help-tip" title="Files in Downloads/Documents/Desktop you haven't opened in 2.5+ years.">?</span> <span class="count" id="stale-count"></span></h2>
     <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
       Files in <code>~/Downloads</code>, <code>~/Documents</code>, and <code>~/Desktop</code> not opened
       or modified in <b>2.5+ years</b>. Largest first. <b>Reveal</b> opens the file in Finder so you can
@@ -2271,7 +2376,7 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 
   <div class="card">
-    <h2>Vendor Cleanup <span class="count" id="vendor-count"></span></h2>
+    <h2>Vendor Cleanup<span class="help-tip" title="Finds every leftover folder an uninstalled app left behind in /Library and ~/Library.">?</span> <span class="count" id="vendor-count"></span></h2>
     <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
       Apps you've uninstalled often leave behind launch agents, support folders, caches, prefs, and helpers
       scattered across <code>/Library</code> and <code>~/Library</code>. This panel finds vendors whose stuff is
@@ -2288,7 +2393,7 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 
   <div class="card">
-    <h2>Stale Vendor Folders <span class="count" id="orphan-count"></span></h2>
+    <h2>Stale Vendor Folders<span class="help-tip" title="Folders in Application Support whose owning app is no longer installed. Usually leftover crud.">?</span> <span class="count" id="orphan-count"></span></h2>
     <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
       Folders in <code>Application Support</code> whose owning app is no longer installed in <code>/Applications</code>.
       These are usually leftover crud from uninstalled software. Tick the ones you don't need and remove together.
@@ -2301,7 +2406,7 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
   </div>
 
   <div class="card">
-    <h2>Security Audit <span class="count" id="sec-count"></span></h2>
+    <h2>Security Audit<span class="help-tip" title="Checks your firewall, FileVault, Gatekeeper, login items, and background launch agents.">?</span> <span class="count" id="sec-count"></span></h2>
     <div id="sec-findings"></div>
     <h2 style="margin-top:18px">Startup Apps (Login Items)</h2>
     <p style="color:var(--dim);font-size:12px;margin:0 0 8px">
@@ -2860,11 +2965,83 @@ async function loadHistory(){
           <td>${o.avg_cpu}%</td><td>${o.max_cpu.toFixed(0)}%</td></tr>`).join('')
     : `<tr><td colspan="4" class="path">No data yet. ${h.count} snapshots stored. Run with <code>--watch</code> for trends.</td></tr>`;
 }
+// ─── PERMISSIONS / ONBOARDING (JS) ───
+async function loadPermissions(){
+  try{
+    const p = await api('/api/permissions');
+    const card = document.getElementById('permissions-card');
+    const list = document.getElementById('permissions-list');
+    if(!card || !list) return;
+    if(p.all_granted){
+      card.style.display = 'none';
+      list.innerHTML = '';
+      return;
+    }
+    card.style.display = '';
+    const items = [];
+    if(!p.fda || !p.fda.granted){
+      items.push(`<div class="issue critical">
+        <div class="msg">Full Disk Access missing</div>
+        <div class="fix">Without Full Disk Access I can't see how much space your Mail and Safari are using — your scan will be incomplete.</div>
+        <div style="margin-top:8px"><button class="danger" onclick="openSettingsPane('fda', this)">Open System Settings → Full Disk Access</button></div>
+      </div>`);
+    }
+    if(!p.automation || !p.automation.granted){
+      items.push(`<div class="issue critical">
+        <div class="msg">Automation (System Events) missing</div>
+        <div class="fix">Without Automation I can't ask macOS which apps are actually running — some panels will be empty.</div>
+        <div style="margin-top:8px"><button class="danger" onclick="openSettingsPane('automation', this)">Open System Settings → Automation</button></div>
+      </div>`);
+    }
+    list.innerHTML = items.join('');
+  }catch(e){ /* non-fatal */ }
+}
+async function openSettingsPane(pane, btn){
+  if(btn){ btn.disabled = true; const o = btn.textContent; btn.textContent = 'Opening…';
+           setTimeout(()=>{ btn.disabled=false; btn.textContent=o; }, 2000); }
+  try{ await api('/api/open-settings', {pane: pane}); }catch(e){}
+}
+
+// ─── FIRST-RUN OVERLAY + PROGRESS ───
+function _showFirstRunOverlay(total){
+  if(localStorage.getItem('macopt_first_run')) return null;
+  const ov = document.getElementById('first-run-overlay');
+  if(!ov) return null;
+  ov.style.display = 'flex';
+  const fill = document.getElementById('fr-bar-fill');
+  const count = document.getElementById('fr-count');
+  let done = 0, dismissed = false;
+  const autoDismissAt = Math.min(10, total);
+  return {
+    tick(){
+      done++;
+      if(fill) fill.style.width = Math.round((done/total)*100) + '%';
+      if(count) count.textContent = done + ' / ' + total;
+      if(!dismissed && done >= autoDismissAt){
+        dismissed = true;
+        setTimeout(()=>{ ov.style.display = 'none'; }, 250);
+      }
+    },
+    finish(){
+      localStorage.setItem('macopt_first_run', '1');
+      ov.style.display = 'none';
+    }
+  };
+}
+
 async function loadAll(){
   document.getElementById('score').textContent='…';
-  await Promise.all([loadHealth(),loadHeal(),loadIntel(),loadDisk(),loadUnused(),loadLarge(),
-                     loadSec(),loadThreats(),loadNetwork(),loadHistory(),
-                     loadVendors(),loadOrphans(),loadStale()]);
+  // Fire permissions check FIRST so the prompt appears before slow scans.
+  loadPermissions();
+  const loaders = [loadHealth,loadHeal,loadIntel,loadDisk,loadUnused,loadLarge,
+                   loadSec,loadThreats,loadNetwork,loadHistory,
+                   loadVendors,loadOrphans,loadStale];
+  const overlay = _showFirstRunOverlay(loaders.length);
+  const wrapped = loaders.map(fn => Promise.resolve().then(fn).finally(()=>{
+    if(overlay) overlay.tick();
+  }));
+  await Promise.allSettled(wrapped);
+  if(overlay) overlay.finish();
 }
 loadAll();
 setInterval(loadHealth, 15000);
@@ -2927,6 +3104,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_orphan_app_support())
             if path == "/api/stale-files":
                 return self._send(200, get_stale_files())
+            if path == "/api/permissions":
+                return self._send(200, get_permissions_status())
             if path == "/api/vendor-footprint":
                 vendor = urlparse(self.path).query
                 # Parse ?vendor=adobe
@@ -2967,6 +3146,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, act_trash_files(body.get("paths") or []))
             if path == "/api/reveal":
                 return self._send(200, act_reveal_path(body.get("path")))
+            if path == "/api/open-settings":
+                return self._send(200, act_open_settings(body.get("pane")))
             return self._send(404, {"ok": False, "msg": "unknown action"})
         except Exception as e:
             return self._send(500, {"ok": False, "msg": str(e)})
