@@ -1334,6 +1334,50 @@ def get_history_summary():
         "offenders": get_recurring_offenders(),
     }
 
+def get_session_summary(since_ts):
+    """Compare the snapshot at-or-just-before `since_ts` with the latest snapshot
+    and return per-metric deltas for the Story-mode modal. If `since_ts` is
+    older than the oldest snapshot, use the oldest snapshot instead."""
+    hist = load_history()
+    snaps = hist.get("snapshots", [])
+    if not snaps:
+        return {"error": "no snapshots yet"}
+    try:
+        since_ts = int(since_ts)
+    except (TypeError, ValueError):
+        since_ts = 0
+    # Find the latest snapshot at-or-before since_ts; fall back to oldest.
+    old = None
+    for s in snaps:
+        if s["ts"] <= since_ts:
+            old = s
+        else:
+            break
+    if old is None:
+        old = snaps[0]
+    new = snaps[-1]
+    def _d(a, b):
+        try:
+            return round(b - a, 2)
+        except Exception:
+            return 0
+    return {
+        "since": since_ts,
+        "snapshots_compared": {"old_ts": old["ts"], "new_ts": new["ts"]},
+        "deltas": {
+            "score":         {"old": old.get("score", 0),    "new": new.get("score", 0),
+                              "delta": _d(old.get("score", 0), new.get("score", 0))},
+            "wired_gb":      {"old": old.get("wired_gb", 0), "new": new.get("wired_gb", 0),
+                              "delta": _d(old.get("wired_gb", 0), new.get("wired_gb", 0))},
+            "mem_free_pct":  {"old": old.get("mem_free", 0), "new": new.get("mem_free", 0),
+                              "delta": _d(old.get("mem_free", 0), new.get("mem_free", 0))},
+            "swap_mb":       {"old": old.get("swap_mb", 0),  "new": new.get("swap_mb", 0),
+                              "delta": _d(old.get("swap_mb", 0), new.get("swap_mb", 0))},
+            "disk_used_pct": {"old": old.get("disk_used", 0),"new": new.get("disk_used", 0),
+                              "delta": _d(old.get("disk_used", 0), new.get("disk_used", 0))},
+        },
+    }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Security audit
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2759,12 +2803,32 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
 #first-run-overlay .fr-bar{width:360px;height:10px;background:#1b2230;border-radius:5px;overflow:hidden;border:1px solid var(--border)}
 #first-run-overlay .fr-bar-fill{height:100%;background:var(--accent);width:0%;transition:width .4s ease}
 #first-run-overlay .fr-count{margin-top:10px;font-size:11px;color:var(--dim);font-family:ui-monospace,Menlo,monospace}
+/* Story mode modal */
+.modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.7); display:flex; align-items:center; justify-content:center; z-index:1000; }
+.modal { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:24px; max-width:560px; width:90%; max-height:80vh; overflow-y:auto; position:relative; }
+.modal h2 { margin-top:0; }
+.modal-close { position:absolute; top:16px; right:20px; cursor:pointer; font-size:24px; color:var(--dim); background:none; border:none; }
+.delta-row { display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid var(--border); }
+.delta-arrow { font-weight:700; }
+.delta-arrow.good { color:var(--good); }
+.delta-arrow.bad { color:var(--bad); }
+.delta-arrow.neutral { color:var(--dim); }
+.story-big { font-size:20px; font-weight:700; margin:6px 0 14px; color:var(--accent); }
+.story-section { margin-top:18px; }
+.story-section h3 { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--dim); margin:0 0 8px; }
+.story-actions-list { list-style:none; padding:0; margin:0; font-size:13px; }
+.story-actions-list li { padding:6px 0; border-bottom:1px solid var(--border); color:var(--text); }
+.story-actions-list li:last-child { border-bottom:none; }
+.story-why { font-size:13px; line-height:1.55; color:var(--text); }
+.story-footer { margin-top:18px; padding-top:14px; border-top:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; gap:10px; }
+.story-reset { color:var(--link); background:none; border:none; cursor:pointer; font-size:12px; padding:0; }
 </style>
 </head><body>
 <header>
   <h1>Mac<span>Optimizer</span> &nbsp;·&nbsp; <span id="hostname" style="color:var(--dim);font-weight:400"></span></h1>
   <div style="display:flex;align-items:center;gap:14px">
     <div>Health: <span id="score" class="score">--</span></div>
+    <button id="story-btn" class="primary" onclick="openStoryModal()">What did I just fix?</button>
     <button class="primary" onclick="loadAll()">↻ Refresh</button>
   </div>
 </header>
@@ -2995,6 +3059,18 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
 
 </div>
 
+<div id="story-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeStoryModal()">
+  <div class="modal" role="dialog" aria-modal="true">
+    <button class="modal-close" onclick="closeStoryModal()" aria-label="Close">×</button>
+    <h2>What did I just fix?</h2>
+    <div id="story-body">Loading…</div>
+    <div class="story-footer">
+      <button class="story-reset" onclick="resetStorySession()">Reset session</button>
+      <button class="primary" onclick="storyTakeSnapshot(this)">Take a fresh snapshot</button>
+    </div>
+  </div>
+</div>
+
 <script>
 function toast(msg, ok=true){
   const t=document.createElement('div');
@@ -3020,7 +3096,7 @@ async function action(path, confirmMsg, body){
 // Safe button helpers — receive raw values as function args, never via string-built onclick.
 // Each takes the clicked button as first arg so we can disable it, show progress, and
 // optimistically remove its row from the DOM the moment the action succeeds.
-function _runAction(btn, busyLabel, path, body, confirmMsg){
+function _runAction(btn, busyLabel, path, body, confirmMsg, logEntry){
   if(confirmMsg && !confirm(confirmMsg)) return;
   const originalLabel = btn.textContent;
   btn.disabled = true;
@@ -3028,6 +3104,7 @@ function _runAction(btn, busyLabel, path, body, confirmMsg){
   api(path, body).then(r=>{
     toast(r.msg, r.ok);
     if(r.ok){
+      if(logEntry) logSessionAction(logEntry);
       // Optimistically fade + remove the row container so the user sees the
       // change immediately instead of waiting ~10s for /api/unused to re-scan.
       const row = btn.closest('tr, .proc, .metric');
@@ -3049,21 +3126,35 @@ function _runAction(btn, busyLabel, path, body, confirmMsg){
     btn.textContent = originalLabel;
   });
 }
+// ── Story-mode session log (localStorage) ─────────────────────────────────
+function logSessionAction(entry){
+  try {
+    const key = 'macopt_session_actions';
+    const arr = JSON.parse(localStorage.getItem(key) || '[]');
+    arr.push(Object.assign({ts: Date.now()}, entry));
+    // Cap to last 500 to keep localStorage sane
+    localStorage.setItem(key, JSON.stringify(arr.slice(-500)));
+  } catch(e) {}
+}
 function killProc(btn, pid, friendly, explanation){
   _runAction(btn, 'Killing…', '/api/kill', {pid:pid},
-             'Kill '+friendly+' (PID '+pid+')?\n\n'+(explanation||''));
+             'Kill '+friendly+' (PID '+pid+')?\n\n'+(explanation||''),
+             {kind:'kill', label:friendly, bytes_freed:0, source:'process'});
 }
-function trashPath(btn, path, name){
+function trashPath(btn, path, name, bytes){
   _runAction(btn, 'Moving…', '/api/trash', {path:path},
-             'Move '+name+' to Trash?\n\n'+path);
+             'Move '+name+' to Trash?\n\n'+path,
+             {kind:'trash', label:name, bytes_freed:(bytes||0), source:'unused'});
 }
 function removeLogin(btn, name){
   _runAction(btn, 'Removing…', '/api/remove-login', {name:name},
-             'Remove login item: '+name+'?');
+             'Remove login item: '+name+'?',
+             {kind:'remove', label:name, bytes_freed:0, source:'launch_agent'});
 }
 function removeLaunchAgent(btn, path){
   _runAction(btn, 'Removing…', '/api/remove-launch-agent', {path:path},
-             'Unload and DELETE this launch agent?\n\n'+path);
+             'Unload and DELETE this launch agent?\n\n'+path,
+             {kind:'remove', label:(path.split('/').pop()||path), bytes_freed:0, source:'launch_agent'});
 }
 function pct(v,max=100,warn=70,bad=90){
   const cls = v>=bad?'bad':v>=warn?'warn':'good';
@@ -3071,6 +3162,15 @@ function pct(v,max=100,warn=70,bad=90){
 }
 async function loadHealth(){
   const h = await api('/api/health');
+  // Seed the Story-mode session-start snapshot once per page load (or after 4h).
+  try {
+    const raw = localStorage.getItem('macopt_session_start');
+    const prev = raw ? JSON.parse(raw) : null;
+    const now = Date.now();
+    if(!prev || !prev.ts || (now - prev.ts) > 4*60*60*1000){
+      localStorage.setItem('macopt_session_start', JSON.stringify({ts: now, health: h}));
+    }
+  } catch(e) {}
   document.getElementById('hostname').textContent = h.uptime?'uptime '+h.uptime:'';
   const score = h.score;
   const sEl = document.getElementById('score');
@@ -3164,7 +3264,7 @@ async function loadUnused(){
     <tr><td><div><b>${esc(x.name)}</b></div>${_appDescBlock(x)}</td>
         <td class="path">${x.last_used}</td>
         <td>${x.size_human}</td>
-        <td><button class="danger" onclick='trashPath(this,${JSON.stringify(x.path)},${JSON.stringify(x.name)})'>Trash</button></td>
+        <td><button class="danger" onclick='trashPath(this,${JSON.stringify(x.path)},${JSON.stringify(x.name)},${x.size_bytes||0})'>Trash</button></td>
     </tr>`).join('');
 }
 async function loadLarge(){
@@ -3173,7 +3273,7 @@ async function loadLarge(){
     <tr><td><div><b>${esc(x.name)}</b></div>${_appDescBlock(x)}</td>
         <td><b>${x.size_human}</b></td>
         <td class="path">${x.last_used}</td>
-        <td><button class="danger" onclick='trashPath(this,${JSON.stringify(x.path)},${JSON.stringify(x.name)})'>Trash</button></td>
+        <td><button class="danger" onclick='trashPath(this,${JSON.stringify(x.path)},${JSON.stringify(x.name)},${x.size_bytes||0})'>Trash</button></td>
     </tr>`).join('');
 }
 async function loadSec(){
@@ -3252,6 +3352,8 @@ function removeVendor(btn, vendor, count, sizeHuman){
   api('/api/remove-vendor',{vendor}).then(r=>{
     toast(r.msg, r.ok);
     if(r.ok){
+      logSessionAction({kind:'remove', label:vendor+' (vendor cleanup)',
+                        bytes_freed:(r.bytes_freed||parseHumanBytes(sizeHuman)||0), source:'vendor'});
       const card = btn.closest('.issue');
       if(card){ card.style.transition='opacity .3s'; card.style.opacity='0'; setTimeout(()=>card.remove(),320); }
       setTimeout(loadAll,1500);
@@ -3259,6 +3361,15 @@ function removeVendor(btn, vendor, count, sizeHuman){
       btn.disabled=false; btn.textContent=orig;
     }
   });
+}
+function parseHumanBytes(s){
+  if(!s) return 0;
+  const m = String(s).trim().match(/^([\d.]+)\s*(B|KB|MB|GB|TB|PB)$/i);
+  if(!m) return 0;
+  const n = parseFloat(m[1]);
+  const u = m[2].toUpperCase();
+  const mult = {B:1, KB:1024, MB:1024**2, GB:1024**3, TB:1024**4, PB:1024**5}[u] || 1;
+  return Math.round(n*mult);
 }
 async function previewVendor(){
   const v = document.getElementById('vendor-input').value.trim();
@@ -3333,10 +3444,17 @@ function removeOnePath(btn, path, name){
   if(!confirm('Delete '+name+'?\\n\\n'+path)) return;
   const orig = btn.textContent;
   btn.disabled=true; btn.textContent='Removing…';
+  // Try to pull the row's size cell text as a fallback bytes estimate.
+  let bytes = 0;
+  const row = btn.closest('tr');
+  if(row){
+    const sizeCell = row.querySelector('td:nth-child(3) b, td:nth-child(3)');
+    if(sizeCell) bytes = parseHumanBytes(sizeCell.textContent) || 0;
+  }
   api('/api/remove-paths',{paths:[path]}).then(r=>{
     toast(r.msg, r.ok);
     if(r.ok){
-      const row = btn.closest('tr');
+      logSessionAction({kind:'remove', label:name, bytes_freed:bytes, source:'orphan'});
       if(row){ row.style.transition='opacity .25s'; row.style.opacity='0'; setTimeout(()=>row.remove(),260); }
       setTimeout(loadAll,1500);
     } else {
@@ -3391,7 +3509,8 @@ async function loadThreats(){
 function removeExtension(btn, path, name){
   if(!path){ toast('No path for this extension', false); return; }
   if(!confirm('Remove extension "'+name+'"?\n\nQuit your browser FIRST or it will recreate the folder from sync.\n\n'+path)) return;
-  _runAction(btn, 'Removing…', '/api/remove-extension', {path:path});
+  _runAction(btn, 'Removing…', '/api/remove-extension', {path:path}, null,
+             {kind:'remove', label:name, bytes_freed:0, source:'extension'});
 }
 function revealPath(btn, path){
   if(!path){ toast('No path', false); return; }
@@ -3454,7 +3573,7 @@ function renderStale(){
       </div>
       <div class="btn-row">
         <button class="btn-sm" onclick='revealPath(this,${JSON.stringify(x.path)})'>Reveal</button>
-        <button class="danger btn-sm" onclick='trashOneStale(this,${JSON.stringify(x.path)},${JSON.stringify(x.name)})'>Trash</button>
+        <button class="danger btn-sm" onclick='trashOneStale(this,${JSON.stringify(x.path)},${JSON.stringify(x.name)},${x.size_bytes||0})'>Trash</button>
       </div>
     </div>`;
   }
@@ -3507,9 +3626,10 @@ function trashSelectedStale(){
     }
   });
 }
-function trashOneStale(btn, path, name){
+function trashOneStale(btn, path, name, bytes){
   if(!confirm('Move "'+name+'" to Trash?\\n\\n'+path)) return;
-  _runAction(btn, 'Trashing…', '/api/trash-files', {paths:[path]});
+  _runAction(btn, 'Trashing…', '/api/trash-files', {paths:[path]}, null,
+             {kind:'trash', label:name, bytes_freed:(bytes||0), source:'stale'});
 }
 // ── File Organizer ──────────────────────────────────────────────────────
 let _orgData = [];
@@ -3879,6 +3999,125 @@ async function loadQuickCheck(){
   document.getElementById('qc-allgood').style.display = allGood ? '' : 'none';
 }
 
+// ── Story Mode modal ──────────────────────────────────────────────────────
+// "good direction" per metric: score up, wired down, free up, swap down, disk down.
+const STORY_METRICS = [
+  {key:'score',        label:'Health score',  unit:'',     good:'up',   fmt:v=>Math.round(v)},
+  {key:'wired_gb',     label:'Wired memory',  unit:' GB',  good:'down', fmt:v=>Number(v).toFixed(1)},
+  {key:'mem_free_pct', label:'Free memory',   unit:'%',    good:'up',   fmt:v=>Math.round(v)},
+  {key:'swap_mb',      label:'Swap used',     unit:' MB',  good:'down', fmt:v=>Math.round(v)},
+  {key:'disk_used_pct',label:'Disk used',     unit:'%',    good:'down', fmt:v=>Math.round(v)},
+];
+function openStoryModal(){
+  document.getElementById('story-modal').style.display='flex';
+  renderStoryModal();
+}
+function closeStoryModal(){
+  document.getElementById('story-modal').style.display='none';
+}
+document.addEventListener('keydown', e=>{
+  if(e.key==='Escape' && document.getElementById('story-modal').style.display==='flex'){
+    closeStoryModal();
+  }
+});
+async function renderStoryModal(){
+  const body = document.getElementById('story-body');
+  body.innerHTML = '<div class="path">Loading…</div>';
+  const actions = JSON.parse(localStorage.getItem('macopt_session_actions') || '[]');
+  const start = JSON.parse(localStorage.getItem('macopt_session_start') || 'null');
+  const totalBytes = actions.reduce((a,x)=>a+(x.bytes_freed||0), 0);
+  // Top-line metric
+  let html = '';
+  if(totalBytes > 0){
+    html += `<div class="story-big">You reclaimed ${humanBytes(totalBytes)} this session.</div>`;
+  } else {
+    html += `<div class="story-big">You haven't trashed anything yet — but here's how your Mac is doing right now.</div>`;
+  }
+  // Fetch server deltas
+  let summary = null;
+  try {
+    const sinceTs = start && start.ts ? Math.floor(start.ts/1000) : 0;
+    summary = await api('/api/session-summary?since='+sinceTs);
+  } catch(e) {}
+  const deltas = (summary && summary.deltas) ? summary.deltas : null;
+  if(deltas){
+    html += '<div class="story-section"><h3>What changed</h3>';
+    let rows = '';
+    for(const m of STORY_METRICS){
+      const d = deltas[m.key];
+      if(!d) continue;
+      if(d.delta === 0) continue; // Aby's filter rule
+      const direction = d.delta > 0 ? 'up' : 'down';
+      const isGood = (direction === m.good);
+      const cls = isGood ? 'good' : 'bad';
+      const arrow = direction === 'up' ? '▲' : '▼';
+      rows += `<div class="delta-row">
+        <span>${m.label}</span>
+        <span><span class="delta-arrow ${cls}">${arrow}</span> ${m.fmt(d.old)}${m.unit} → ${m.fmt(d.new)}${m.unit}</span>
+      </div>`;
+    }
+    if(!rows) rows = '<div class="path">No measurable change since session start.</div>';
+    html += rows + '</div>';
+  } else if(summary && summary.error){
+    html += `<div class="story-section"><div class="path">${esc(summary.error)}</div></div>`;
+  }
+  // Action list — newest first, capped at 20
+  if(actions.length){
+    const sorted = actions.slice().sort((a,b)=>b.ts-a.ts).slice(0,20);
+    html += '<div class="story-section"><h3>What you did</h3><ul class="story-actions-list">';
+    for(const a of sorted){
+      const sizePart = a.bytes_freed > 0 ? ' ('+humanBytes(a.bytes_freed)+')' : '';
+      const verb = a.kind==='trash' ? 'Trashed'
+                 : a.kind==='kill'  ? 'Killed'
+                 : a.kind==='clean' ? 'Cleaned'
+                 : 'Removed';
+      html += `<li>${verb} ${esc(a.label||'item')}${sizePart}</li>`;
+    }
+    html += '</ul></div>';
+  }
+  // Why this matters
+  html += '<div class="story-section"><h3>Why this matters</h3><div class="story-why">';
+  const reasons = [];
+  if(deltas){
+    if(deltas.mem_free_pct && deltas.mem_free_pct.delta >= 15)
+      reasons.push('Your apps will open faster and Safari tabs will stop reloading.');
+    if(deltas.wired_gb && deltas.wired_gb.delta <= -1)
+      reasons.push('Your Mac will run cooler — fans should spin down.');
+    if(deltas.swap_mb && deltas.swap_mb.delta <= -500)
+      reasons.push('Stuttering and beach-balls should be gone.');
+    if(deltas.disk_used_pct && deltas.disk_used_pct.delta <= -2)
+      reasons.push('Time Machine backups will finish again, and macOS will stop warning you about disk space.');
+    if(deltas.score && deltas.score.delta >= 10)
+      reasons.push("You moved from 'struggling' to 'healthy.'");
+  }
+  if(reasons.length === 0){
+    html += 'Your Mac was already in good shape — most of these actions were preventive.';
+  } else {
+    html += reasons.map(r=>'• '+esc(r)).join('<br>');
+  }
+  html += '</div></div>';
+  body.innerHTML = html;
+}
+function resetStorySession(){
+  if(!confirm('Clear this session log and start fresh?')) return;
+  localStorage.removeItem('macopt_session_actions');
+  localStorage.removeItem('macopt_session_start');
+  // Re-seed a new start snapshot immediately from current health
+  api('/api/snapshot').then(()=>{
+    api('/api/health').then(h=>{
+      localStorage.setItem('macopt_session_start', JSON.stringify({ts: Date.now(), health: h}));
+      renderStoryModal();
+    });
+  });
+}
+function storyTakeSnapshot(btn){
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Snapshotting…';
+  api('/api/snapshot').then(()=>{
+    btn.disabled = false; btn.textContent = orig;
+    renderStoryModal();
+  }).catch(()=>{ btn.disabled=false; btn.textContent=orig; });
+}
 async function loadAll(){
   document.getElementById('score').textContent='…';
   // Fire permissions check FIRST so the prompt appears before slow scans.
@@ -3949,6 +4188,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_history_summary())
             if path == "/api/snapshot":
                 return self._send(200, take_snapshot())
+            if path == "/api/session-summary":
+                q = urlparse(self.path).query
+                since = 0
+                for kv in q.split("&"):
+                    if kv.startswith("since="):
+                        try:
+                            since = int(kv[6:])
+                        except ValueError:
+                            since = 0
+                        break
+                return self._send(200, get_session_summary(since))
             if path == "/api/dead-vendors":
                 return self._send(200, detect_dead_vendors())
             if path == "/api/orphan-folders":
