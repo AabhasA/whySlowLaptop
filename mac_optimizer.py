@@ -20,7 +20,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 PORT = 8765
 HOME = Path.home()
@@ -896,6 +896,277 @@ def _scan_stale_files(min_days=_STALE_MIN_DAYS, min_bytes=_STALE_MIN_BYTES, limi
     return capped
 
 # ─────────────────────────────────────────────────────────────────────────────
+# File Organizer — bucket every ≥1 MB file in Downloads/Documents/Desktop by
+# AGE first (Aby's explicit preference), then by CATEGORY (images, videos,
+# documents, installers, other). Feeds a 5×5 grid in the dashboard. Drilldowns
+# return the actual files for one (age, category) cell on demand.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ORG_ROOTS = _STALE_FILE_ROOTS  # same three roots as stale-files
+_ORG_MAX_DEPTH = 4
+_ORG_MIN_BYTES = 1 * 1024 * 1024
+
+_ORG_AGE_LABELS = ["Last 1 year", "1–2 years", "2–3 years", "3–5 years", "5+ years"]
+_ORG_CAT_NAMES  = ["Images", "Videos", "Documents", "Installers", "Other"]
+
+_ORG_EXT_MAP = {
+    "Images":     {".jpg",".jpeg",".png",".gif",".heic",".webp",".raw",".tif",".tiff",".bmp",".svg"},
+    "Videos":     {".mp4",".mov",".avi",".mkv",".webm",".wmv",".m4v",".flv",".mpeg",".mpg"},
+    "Documents":  {".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".txt",".md",".pages",".numbers",".key",".rtf",".odt",".csv"},
+    "Installers": {".dmg",".pkg",".zip",".tar",".gz",".tgz",".bz2",".7z",".iso",".deb",".rpm"},
+}
+
+def _org_classify_ext(fn):
+    ext = os.path.splitext(fn)[1].lower()
+    for cat, exts in _ORG_EXT_MAP.items():
+        if ext in exts:
+            return cat
+    return "Other"
+
+def _org_age_index(age_years):
+    if age_years < 1: return 0
+    if age_years < 2: return 1
+    if age_years < 3: return 2
+    if age_years < 5: return 3
+    return 4
+
+_ORG_CACHE = {"summary": None, "files": None, "ts": 0}
+_ORG_CACHE_TTL = 300  # 5 minutes
+
+def _scan_organizer():
+    """Walk the three roots, bucket every file ≥1 MB by (age, category).
+    Returns (summary, files_by_cell) where files_by_cell is a dict
+    keyed by (age_idx, cat_name) → list of file dicts sorted largest-first."""
+    now = time.time()
+    # age_idx → cat_name → list
+    files_by_cell = {i: {c: [] for c in _ORG_CAT_NAMES} for i in range(5)}
+    for root in _ORG_ROOTS:
+        if not root.exists():
+            continue
+        root_str = str(root)
+        for dirpath, dirnames, filenames in os.walk(root_str):
+            depth = dirpath[len(root_str):].count(os.sep)
+            if depth >= _ORG_MAX_DEPTH:
+                dirnames[:] = []
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".")
+                           and not d.endswith(".app")
+                           and d not in _STALE_SKIP_DIRS]
+            for fn in filenames:
+                if fn.startswith(".") or fn == "Icon\r":
+                    continue
+                fp = os.path.join(dirpath, fn)
+                if "mac_optimizer" in fp.lower():
+                    continue
+                try:
+                    st = os.stat(fp)
+                except Exception:
+                    continue
+                if st.st_size < _ORG_MIN_BYTES:
+                    continue
+                last = max(st.st_mtime, st.st_atime)
+                age_days = max(0, int((now - last) / 86400))
+                age_years = age_days / 365.25
+                age_idx = _org_age_index(age_years)
+                cat = _org_classify_ext(fn)
+                files_by_cell[age_idx][cat].append({
+                    "path": fp,
+                    "name": fn,
+                    "size_bytes": st.st_size,
+                    "size_human": human(st.st_size),
+                    "last_used": time.strftime("%Y-%m-%d", time.localtime(last)),
+                    "age_days": age_days,
+                    "age_years": round(age_years, 1),
+                    "root": root.name,
+                })
+    # Sort each cell's files largest-first
+    for i in range(5):
+        for c in _ORG_CAT_NAMES:
+            files_by_cell[i][c].sort(key=lambda x: -x["size_bytes"])
+    # Build the summary grid — always 5 age rows, always 5 categories each.
+    summary = []
+    for i, label in enumerate(_ORG_AGE_LABELS):
+        cats = []
+        total_count = 0
+        total_bytes = 0
+        for c in _ORG_CAT_NAMES:
+            lst = files_by_cell[i][c]
+            cnt = len(lst)
+            bts = sum(f["size_bytes"] for f in lst)
+            total_count += cnt
+            total_bytes += bts
+            cats.append({
+                "name": c,
+                "count": cnt,
+                "size_bytes": bts,
+                "size_human": human(bts) if bts else "—",
+            })
+        summary.append({
+            "age": label,
+            "age_order": i,
+            "is_current": i == 0,
+            "categories": cats,
+            "total_count": total_count,
+            "total_human": human(total_bytes) if total_bytes else "—",
+        })
+    return summary, files_by_cell
+
+def get_file_organizer():
+    now = time.time()
+    if _ORG_CACHE["summary"] is not None and (now - _ORG_CACHE["ts"]) < _ORG_CACHE_TTL:
+        return _ORG_CACHE["summary"]
+    summary, files = _scan_organizer()
+    _ORG_CACHE["summary"] = summary
+    _ORG_CACHE["files"]   = files
+    _ORG_CACHE["ts"]      = now
+    return summary
+
+def get_organizer_drill(age_order, category, cap=100):
+    # Ensure the cache is warm — reuses the same walk as the summary so
+    # drilldown is basically free.
+    if _ORG_CACHE["files"] is None or (time.time() - _ORG_CACHE["ts"]) >= _ORG_CACHE_TTL:
+        get_file_organizer()
+    try:
+        ai = int(age_order)
+    except Exception:
+        return []
+    if ai < 0 or ai > 4:
+        return []
+    if category not in _ORG_CAT_NAMES:
+        return []
+    cell = _ORG_CACHE["files"].get(ai, {}).get(category, [])
+    return cell[:cap]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Duplicate File Finder — pure-stdlib sha1 dedupe across user content roots.
+# Three-stage pipeline (size → first-64k hash → full hash) so we only fully
+# read files that already share a size AND a partial hash. Read-only: this
+# module never deletes anything; trashing a single copy goes through the
+# dedicated act_trash_one_duplicate() endpoint which re-validates the path.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DUP_ROOTS = [HOME / "Downloads", HOME / "Documents", HOME / "Desktop",
+              HOME / "Movies", HOME / "Music"]
+_DUP_MAX_DEPTH = 5
+_DUP_MIN_BYTES = 10 * 1024 * 1024  # 10 MB — cheap wins only
+_DUP_CAP       = 50
+_DUP_SKIP_DIRS = set(_STALE_SKIP_DIRS) | {"Photos Library.photoslibrary"}
+
+_DUP_CACHE = {"data": None, "ts": 0}
+_DUP_CACHE_TTL = 600  # 10 minutes
+
+# Priority for "keep one" convenience button — higher wins.
+_DUP_ROOT_KEEP_PRIORITY = {"Documents": 5, "Desktop": 4, "Downloads": 3,
+                           "Movies": 2, "Music": 1}
+
+def _dup_hash_partial(path, n=64*1024):
+    import hashlib
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            h.update(f.read(n))
+    except Exception:
+        return None
+    return h.hexdigest()
+
+def _dup_hash_full(path):
+    import hashlib
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except Exception:
+        return None
+    return h.hexdigest()
+
+def _scan_duplicates(min_bytes=_DUP_MIN_BYTES):
+    # Stage 1: walk + collect (path, size)
+    by_size = {}
+    for root in _DUP_ROOTS:
+        if not root.exists():
+            continue
+        root_str = str(root)
+        for dirpath, dirnames, filenames in os.walk(root_str):
+            depth = dirpath[len(root_str):].count(os.sep)
+            if depth >= _DUP_MAX_DEPTH:
+                dirnames[:] = []
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".")
+                           and not d.endswith(".app")
+                           and not d.endswith(".photoslibrary")
+                           and d not in _DUP_SKIP_DIRS]
+            for fn in filenames:
+                if fn.startswith(".") or fn == "Icon\r":
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(fp)
+                except Exception:
+                    continue
+                if st.st_size < min_bytes:
+                    continue
+                by_size.setdefault(st.st_size, []).append((fp, st.st_mtime, root.name))
+    # Drop singletons
+    candidates = {sz: lst for sz, lst in by_size.items() if len(lst) > 1}
+    # Stage 2: partial hash
+    by_partial = {}
+    for sz, lst in candidates.items():
+        sub = {}
+        for fp, mt, rn in lst:
+            ph = _dup_hash_partial(fp)
+            if ph is None:
+                continue
+            sub.setdefault((sz, ph), []).append((fp, mt, rn))
+        for key, items in sub.items():
+            if len(items) > 1:
+                by_partial[key] = items
+    # Stage 3: full hash
+    dup_sets = []
+    for (sz, _ph), items in by_partial.items():
+        sub = {}
+        for fp, mt, rn in items:
+            fh = _dup_hash_full(fp)
+            if fh is None:
+                continue
+            sub.setdefault(fh, []).append((fp, mt, rn))
+        for fh, group in sub.items():
+            if len(group) < 2:
+                continue
+            files = []
+            for fp, mt, rn in group:
+                files.append({
+                    "path": fp,
+                    "name": os.path.basename(fp),
+                    "root": rn,
+                    "last_used": time.strftime("%Y-%m-%d", time.localtime(mt)),
+                })
+            wasted = (len(group) - 1) * sz
+            dup_sets.append({
+                "hash": fh,
+                "size_bytes": sz,
+                "size_human": human(sz),
+                "count": len(group),
+                "wasted_bytes": wasted,
+                "wasted_human": human(wasted),
+                "files": files,
+            })
+    dup_sets.sort(key=lambda d: -d["wasted_bytes"])
+    return dup_sets[:_DUP_CAP]
+
+def get_duplicates():
+    now = time.time()
+    if _DUP_CACHE["data"] is not None and (now - _DUP_CACHE["ts"]) < _DUP_CACHE_TTL:
+        return _DUP_CACHE["data"]
+    data = _scan_duplicates()
+    _DUP_CACHE["data"] = data
+    _DUP_CACHE["ts"] = now
+    return data
+
+# ─────────────────────────────────────────────────────────────────────────────
 # History / recurring-offender detection
 # ─────────────────────────────────────────────────────────────────────────────
 def load_history():
@@ -1609,6 +1880,37 @@ def act_trash_files(paths):
         _STALE_CACHE["ts"] = 0
     return {"ok": moved > 0, "msg": " · ".join(parts), "removed": moved}
 
+def act_trash_one_duplicate(path):
+    """Move a single duplicate-file copy to ~/.Trash. Unlike act_trash_files,
+    this validates against the duplicate-scan roots (which include ~/Movies
+    and ~/Music), not the stale-files roots. Re-validates every time — a
+    hand-crafted API call can never escape into /Library or system dirs."""
+    if not path or not isinstance(path, str):
+        return {"ok": False, "msg": "No path given"}
+    try:
+        sp = str(Path(path).resolve())
+    except Exception:
+        return {"ok": False, "msg": "Invalid path"}
+    allowed_prefixes = [str(r) + "/" for r in _DUP_ROOTS]
+    if not any(sp.startswith(pref) for pref in allowed_prefixes):
+        return {"ok": False, "msg": "Refused: path not in an allowed root"}
+    if "mac_optimizer" in sp.lower():
+        return {"ok": False, "msg": "Refused: optimizer file"}
+    p = Path(sp)
+    if not p.exists():
+        return {"ok": False, "msg": "Path no longer exists"}
+    TRASH.mkdir(exist_ok=True)
+    try:
+        ts = int(time.time())
+        dest = TRASH / f"{p.name}__{ts}"
+        shutil.move(str(p), str(dest))
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+    # Invalidate duplicates cache so it reflects the move.
+    _DUP_CACHE["data"] = None
+    _DUP_CACHE["ts"] = 0
+    return {"ok": True, "msg": f"Trashed {p.name}", "removed": 1}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Vendor cleanup — find and bulk-remove every trace of an uninstalled app.
 #
@@ -2075,6 +2377,37 @@ table{width:100%;border-collapse:collapse;font-size:12px;table-layout:auto}
 .bucket-title{font-size:12px;font-weight:700;letter-spacing:.4px;
               text-transform:uppercase;color:var(--bad)}
 .bucket-meta{font-size:11px;color:var(--dim)}
+.org-row{display:flex;gap:8px;align-items:stretch;margin:8px 0;padding:8px;
+         border-radius:6px;background:#0e1218;border-left:3px solid #2a3140}
+.org-row.current{border-left-color:var(--good);background:rgba(74,222,128,.04)}
+.org-row-label{flex:0 0 140px;display:flex;flex-direction:column;justify-content:center;
+               padding:0 10px;font-size:12px;font-weight:700;color:var(--fg);
+               border-right:1px solid #1f2530}
+.org-row-label .sub{font-size:10px;font-weight:400;color:var(--dim);margin-top:3px}
+.org-row.current .org-row-label{color:var(--good)}
+.org-cells{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;flex:1;min-width:0}
+.org-cell{padding:8px;border-radius:5px;background:#161b23;cursor:pointer;
+          border:1px solid #1f2530;transition:background .15s, border-color .15s;
+          display:flex;flex-direction:column;gap:3px}
+.org-cell:hover{background:#1c2230;border-color:#3a4558}
+.org-cell.empty{opacity:.35;cursor:default}
+.org-cell.empty:hover{background:#161b23;border-color:#1f2530}
+.org-cell.active{border-color:var(--warn);background:#1e2330}
+.org-cell .cat{font-size:11px;font-weight:600;color:var(--fg)}
+.org-cell .cnt{font-size:12px;color:var(--dim)}
+.org-cell .sz {font-size:11px;color:var(--warn)}
+.org-drill{margin:6px 0 10px;padding:10px;background:#0b0f15;
+           border-radius:6px;border:1px solid #1f2530}
+.org-drill .drill-head{display:flex;justify-content:space-between;align-items:center;
+                       margin-bottom:8px;font-size:12px;color:var(--dim)}
+.dup-group{margin:10px 0;padding:10px;background:#0e1218;border-radius:6px;
+           border-left:3px solid var(--warn)}
+.dup-group .dup-head{display:flex;justify-content:space-between;align-items:center;
+                     cursor:pointer;gap:10px;flex-wrap:wrap}
+.dup-group .dup-title{font-size:13px;font-weight:600;color:var(--fg)}
+.dup-group .dup-meta{font-size:11px;color:var(--dim)}
+.dup-group .dup-body{margin-top:10px;display:none}
+.dup-group.open .dup-body{display:block}
 th{text-align:left;padding:6px 8px;color:var(--dim);font-weight:600;
    border-bottom:1px solid var(--border);text-transform:uppercase;font-size:10px;letter-spacing:.5px}
 td{padding:6px 8px;border-bottom:1px solid var(--border)}
@@ -2268,6 +2601,26 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
       <button onclick="stalePage(-1)" id="stale-prev">‹ Prev</button>
       <button onclick="stalePage(1)"  id="stale-next">Next ›</button>
     </div>
+  </div>
+
+  <div class="card" id="organizer-card">
+    <h2>File Organizer (by age &amp; type) <span class="count" id="org-count"></span></h2>
+    <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
+      Every file ≥1 MB in <code>~/Downloads</code>, <code>~/Documents</code>, and <code>~/Desktop</code>,
+      grouped by how old it is and what kind it is. Click any cell to see the actual files.
+      The <b>Last 1 year</b> row is your recent stuff — leave it alone.
+    </p>
+    <div id="org-grid"></div>
+  </div>
+
+  <div class="card" id="duplicates-card" style="display:none">
+    <h2>Duplicate Files <span class="count" id="dup-count"></span></h2>
+    <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
+      Identical files (same content, verified by hash) ≥10 MB across
+      <code>~/Downloads</code>, <code>~/Documents</code>, <code>~/Desktop</code>, <code>~/Movies</code>,
+      <code>~/Music</code>. Sorted by wasted space. <b>Trash this copy</b> is recoverable.
+    </p>
+    <div id="dup-list"></div>
   </div>
 
   <div class="card">
@@ -2842,6 +3195,219 @@ function trashOneStale(btn, path, name){
   if(!confirm('Move "'+name+'" to Trash?\\n\\n'+path)) return;
   _runAction(btn, 'Trashing…', '/api/trash-files', {paths:[path]});
 }
+// ── File Organizer ──────────────────────────────────────────────────────
+let _orgData = [];
+async function loadOrganizer(){
+  _orgData = await api('/api/organizer');
+  renderOrganizer();
+}
+function renderOrganizer(){
+  const grid = document.getElementById('org-grid');
+  const totalFiles = _orgData.reduce((a,b)=>a+b.total_count,0);
+  document.getElementById('org-count').textContent =
+    totalFiles===0 ? 'nothing ≥1 MB' : totalFiles+' file'+(totalFiles===1?'':'s');
+  if(!_orgData.length){ grid.innerHTML=''; return; }
+  let html = '';
+  for(const row of _orgData){
+    const cls = row.is_current ? 'org-row current' : 'org-row';
+    const sub = row.is_current
+      ? 'Current — leave alone'
+      : (row.total_count+' · '+row.total_human);
+    html += `<div class="${cls}">
+      <div class="org-row-label">
+        <div>${esc(row.age)}</div>
+        <div class="sub">${esc(sub)}</div>
+      </div>
+      <div class="org-cells">`;
+    for(const c of row.categories){
+      const empty = c.count === 0 ? ' empty' : '';
+      const clickAttr = c.count === 0
+        ? ''
+        : ` onclick="toggleOrgDrill(this,${row.age_order},${JSON.stringify(c.name)})"`;
+      html += `<div class="org-cell${empty}" data-age="${row.age_order}" data-cat="${esc(c.name)}"${clickAttr}>
+        <div class="cat">${esc(c.name)}</div>
+        <div class="cnt">${c.count} file${c.count===1?'':'s'}</div>
+        <div class="sz">${esc(c.size_human)}</div>
+      </div>`;
+    }
+    html += `</div></div>
+    <div class="org-drill" id="org-drill-${row.age_order}" style="display:none"></div>`;
+  }
+  grid.innerHTML = html;
+}
+async function toggleOrgDrill(cell, ageOrder, cat){
+  const drill = document.getElementById('org-drill-'+ageOrder);
+  // Close if re-clicking the same active cell
+  if(cell.classList.contains('active')){
+    cell.classList.remove('active');
+    drill.style.display='none';
+    drill.innerHTML='';
+    return;
+  }
+  // Clear other active cells in this row
+  cell.parentElement.querySelectorAll('.org-cell.active').forEach(c=>c.classList.remove('active'));
+  cell.classList.add('active');
+  drill.style.display='block';
+  drill.innerHTML = '<div class="drill-head"><span>Loading…</span></div>';
+  const rows = await api('/api/organizer-drill?age='+encodeURIComponent(ageOrder)+'&cat='+encodeURIComponent(cat));
+  renderOrgDrill(drill, rows, ageOrder, cat);
+}
+function renderOrgDrill(drill, rows, ageOrder, cat){
+  if(!rows || rows.length === 0){
+    drill.innerHTML = '<div class="drill-head"><span>No files in this cell.</span></div>';
+    return;
+  }
+  const isCurrent = ageOrder === 0;
+  const totalBytes = rows.reduce((a,x)=>a+x.size_bytes,0);
+  let html = `<div class="drill-head">
+    <span><b>${esc(cat)}</b> · ${rows.length} file${rows.length===1?'':'s'} · ${humanBytes(totalBytes)}${rows.length>=100?' (top 100)':''}</span>`;
+  if(!isCurrent){
+    html += `<button class="danger btn-sm" onclick="trashSelectedOrg(this,${ageOrder},${JSON.stringify(cat)})">Move selected to Trash</button>`;
+  } else {
+    html += `<span class="tag good">Current — read-only</span>`;
+  }
+  html += `</div>`;
+  for(const x of rows){
+    html += `<div class="proc" data-path='${JSON.stringify(x.path)}'>
+      <div style="display:flex;align-items:flex-start;gap:10px;flex:1;min-width:0">`;
+    if(!isCurrent){
+      html += `<input type="checkbox" class="org-cb" style="margin-top:4px;flex-shrink:0">`;
+    }
+    html += `<div class="left" style="min-width:0">
+          <div class="friendly" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span style="word-break:break-word">${esc(x.name)}</span>
+            <span class="tag bad">${x.age_years}y old</span>
+            <span class="tag warn">${x.size_human}</span>
+            <span class="tag" style="background:#1b2230;color:var(--dim)">~/${esc(x.root)}</span>
+          </div>
+          <div class="raw">last touched ${esc(x.last_used)} · <span title="${esc(x.path)}">${esc(x.path)}</span></div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn-sm" onclick='revealPath(this,${JSON.stringify(x.path)})'>Reveal</button>`;
+    if(!isCurrent){
+      html += `<button class="danger btn-sm" onclick='trashOneStale(this,${JSON.stringify(x.path)},${JSON.stringify(x.name)})'>Trash</button>`;
+    }
+    html += `</div></div>`;
+  }
+  drill.innerHTML = html;
+}
+function trashSelectedOrg(btn, ageOrder, cat){
+  const drill = btn.closest('.org-drill');
+  const checked = drill.querySelectorAll('.org-cb:checked');
+  const paths = Array.from(checked).map(cb=>JSON.parse(cb.closest('[data-path]').getAttribute('data-path')));
+  if(paths.length === 0){ toast('Nothing selected', false); return; }
+  if(!confirm('Move '+paths.length+' file'+(paths.length>1?'s':'')+' to Trash?\n\nYou can recover them from Trash if you change your mind.')) return;
+  api('/api/trash-files',{paths}).then(r=>{
+    toast(r.msg, r.ok);
+    if(r.ok){
+      setTimeout(()=>{ loadOrganizer(); loadStale(); loadHealth(); }, 800);
+    }
+  });
+}
+
+// ── Duplicate Files ─────────────────────────────────────────────────────
+let _dupSets = [];
+async function loadDuplicates(){
+  _dupSets = await api('/api/duplicates');
+  renderDuplicates();
+}
+function renderDuplicates(){
+  const card = document.getElementById('duplicates-card');
+  const list = document.getElementById('dup-list');
+  if(!_dupSets || _dupSets.length === 0){
+    card.style.display='none';
+    return;
+  }
+  card.style.display='';
+  const totalWasted = _dupSets.reduce((a,d)=>a+d.wasted_bytes,0);
+  document.getElementById('dup-count').textContent =
+    _dupSets.length+' set'+(_dupSets.length===1?'':'s')+' · '+humanBytes(totalWasted)+' wasted';
+  let html = '';
+  _dupSets.forEach((d, idx)=>{
+    html += `<div class="dup-group" id="dup-g-${idx}">
+      <div class="dup-head" onclick="toggleDup(${idx})">
+        <div class="dup-title">${d.count} copies × ${esc(d.size_human)}
+          <span class="tag warn">${esc(d.wasted_human)} wasted</span></div>
+        <div class="dup-meta">
+          <span>${esc(d.files[0].name)}</span>
+          <button class="btn-sm" onclick="event.stopPropagation();trashAllButOne(this,${idx})">Trash all but one</button>
+          <button class="btn-sm" onclick="event.stopPropagation();toggleDup(${idx})">Show files</button>
+        </div>
+      </div>
+      <div class="dup-body">`;
+    for(const f of d.files){
+      html += `<div class="proc" data-path='${JSON.stringify(f.path)}'>
+        <div class="left" style="min-width:0">
+          <div class="friendly" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span style="word-break:break-word">${esc(f.name)}</span>
+            <span class="tag" style="background:#1b2230;color:var(--dim)">~/${esc(f.root)}</span>
+          </div>
+          <div class="raw">last touched ${esc(f.last_used)} · <span title="${esc(f.path)}">${esc(f.path)}</span></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn-sm" onclick='revealPath(this,${JSON.stringify(f.path)})'>Reveal</button>
+          <button class="danger btn-sm" onclick='trashOneDuplicate(this,${JSON.stringify(f.path)},${JSON.stringify(f.name)})'>Trash this copy</button>
+        </div>
+      </div>`;
+    }
+    html += `</div></div>`;
+  });
+  list.innerHTML = html;
+}
+function toggleDup(idx){
+  const g = document.getElementById('dup-g-'+idx);
+  if(g) g.classList.toggle('open');
+}
+function trashOneDuplicate(btn, path, name){
+  if(!confirm('Move this copy of "'+name+'" to Trash?\n\n'+path)) return;
+  btn.disabled = true;
+  btn.textContent = 'Trashing…';
+  api('/api/trash-duplicate',{path:path}).then(r=>{
+    toast(r.msg, r.ok);
+    if(r.ok){
+      const row = btn.closest('.proc');
+      if(row){
+        row.style.transition='opacity .25s';
+        row.style.opacity='0';
+        setTimeout(()=>row.remove(), 260);
+      }
+      setTimeout(loadDuplicates, 1500);
+    } else {
+      btn.disabled = false;
+      btn.textContent = 'Trash this copy';
+    }
+  });
+}
+const _DUP_ROOT_PRIORITY = {"Documents":5,"Desktop":4,"Downloads":3,"Movies":2,"Music":1};
+function trashAllButOne(btn, idx){
+  const d = _dupSets[idx];
+  if(!d || d.files.length < 2) return;
+  // Pick the keeper — highest priority root, tiebreak by path length (shorter = probably the "real" copy)
+  let keepIdx = 0;
+  let bestScore = -1;
+  d.files.forEach((f,i)=>{
+    const score = (_DUP_ROOT_PRIORITY[f.root]||0)*10000 - f.path.length;
+    if(score > bestScore){ bestScore = score; keepIdx = i; }
+  });
+  const keep = d.files[keepIdx];
+  const toDelete = d.files.filter((_,i)=>i!==keepIdx);
+  if(!confirm('Keep:\n  '+keep.path+'\n\nMove these '+toDelete.length+' copies to Trash?\n\n'
+              + toDelete.map(f=>'  '+f.path).join('\n'))) return;
+  btn.disabled = true;
+  btn.textContent = 'Trashing…';
+  // Sequential so we get a clear error if one fails.
+  (async ()=>{
+    let ok = 0, fail = 0;
+    for(const f of toDelete){
+      const r = await api('/api/trash-duplicate',{path:f.path});
+      if(r.ok) ok++; else fail++;
+    }
+    toast('Trashed '+ok+(fail?' · '+fail+' failed':''), ok>0);
+    setTimeout(loadDuplicates, 800);
+  })();
+}
+
 async function loadNetwork(){
   const n = await api('/api/network');
   document.getElementById('net-count').textContent = n.length;
@@ -2864,7 +3430,8 @@ async function loadAll(){
   document.getElementById('score').textContent='…';
   await Promise.all([loadHealth(),loadHeal(),loadIntel(),loadDisk(),loadUnused(),loadLarge(),
                      loadSec(),loadThreats(),loadNetwork(),loadHistory(),
-                     loadVendors(),loadOrphans(),loadStale()]);
+                     loadVendors(),loadOrphans(),loadStale(),
+                     loadOrganizer(),loadDuplicates()]);
 }
 loadAll();
 setInterval(loadHealth, 15000);
@@ -2927,6 +3494,28 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_orphan_app_support())
             if path == "/api/stale-files":
                 return self._send(200, get_stale_files())
+            if path == "/api/organizer":
+                return self._send(200, get_file_organizer())
+            if path == "/api/organizer-drill":
+                q = urlparse(self.path).query
+                age_raw = ""
+                cat_raw = ""
+                for kv in q.split("&"):
+                    if kv.startswith("age="):
+                        age_raw = kv[4:]
+                    elif kv.startswith("cat="):
+                        cat_raw = unquote(kv[4:])
+                try:
+                    ai = int(age_raw)
+                except Exception:
+                    return self._send(400, {"error": "bad age"})
+                if ai < 0 or ai > 4:
+                    return self._send(400, {"error": "age out of range"})
+                if cat_raw not in _ORG_CAT_NAMES:
+                    return self._send(400, {"error": "bad category"})
+                return self._send(200, get_organizer_drill(ai, cat_raw))
+            if path == "/api/duplicates":
+                return self._send(200, get_duplicates())
             if path == "/api/vendor-footprint":
                 vendor = urlparse(self.path).query
                 # Parse ?vendor=adobe
@@ -2965,6 +3554,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, act_remove_extension(body.get("path")))
             if path == "/api/trash-files":
                 return self._send(200, act_trash_files(body.get("paths") or []))
+            if path == "/api/trash-duplicate":
+                return self._send(200, act_trash_one_duplicate(body.get("path")))
             if path == "/api/reveal":
                 return self._send(200, act_reveal_path(body.get("path")))
             return self._send(404, {"ok": False, "msg": "unknown action"})
@@ -3009,6 +3600,11 @@ def main():
     # ~/Documents can take 20-30 seconds, and we don't want the first page
     # load to block on it. By the time the user clicks around, it's ready.
     threading.Thread(target=get_stale_files, daemon=True).start()
+    # Also pre-warm the organizer and duplicate-finder caches — both walk
+    # large trees and can take 10-60s, so a cold first-click would otherwise
+    # block the dashboard.
+    threading.Thread(target=get_file_organizer, daemon=True).start()
+    threading.Thread(target=get_duplicates, daemon=True).start()
     url = f"http://localhost:{PORT}"
     print(f"\n🔧 Mac Optimizer running at {url}")
     if "--watch" in args:
