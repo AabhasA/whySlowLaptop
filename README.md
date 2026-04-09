@@ -1,5 +1,7 @@
 # whySlowLaptop
 
+> Make your laptop fast locally — know what's eating it up.
+
 **A single-file local dashboard that tells you, in plain English, why your laptop is slow — and gives you one-click buttons to fix it.**
 
 No installer. No login. No telemetry. No cloud. No subscription. Clone it, double-click, a dashboard opens in your browser at `http://localhost:8765`.
