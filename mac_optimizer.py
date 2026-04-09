@@ -3221,16 +3221,6 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
     </div>
   </div>
 
-  <div class="card" id="memhogs-card">
-    <h2>Memory Hogs<span class="help-tip" title="Apps using the most RAM right now, grouped by app (so all the Chrome tabs collapse into one row). Quit the top one to free swap pressure fastest.">?</span> <span class="count" id="memhogs-count"></span></h2>
-    <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
-      Sorted by RAM, not CPU. Browser tabs are grouped together so you see the real total.
-      Click <b>Kill</b> on the biggest one to free RAM and stop new swapping immediately.
-      Existing swap-on-disk only clears with a reboot.
-    </p>
-    <div id="memhogs-list"></div>
-  </div>
-
   <div class="card" id="permissions-card" style="display:none">
     <h2>Permissions Needed<span class="help-tip" title="macOS won't let this dashboard see some files until you grant permission. Click the buttons below to open System Settings.">?</span></h2>
     <div class="perm-sub">macOS needs your OK before this dashboard can see some things. Grant these once and you're done.</div>
@@ -3252,6 +3242,16 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
       The verdict tag tells you whether killing is safe.
     </p>
     <div id="intel-list"></div>
+  </div>
+
+  <div class="card" id="memhogs-card">
+    <h2>Memory Hogs<span class="help-tip" title="Apps using the most RAM right now, grouped by app (so all the Chrome tabs collapse into one row).">?</span> <span class="count" id="memhogs-count"></span></h2>
+    <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
+      Sorted by RAM, grouped by app so browser tabs collapse into one row.
+      For an essential app like your browser, restart it (Cmd-Q then reopen) instead of killing —
+      it'll restore your tabs but drop the leaked renderer memory.
+    </p>
+    <div id="memhogs-list"></div>
   </div>
 
   <div class="card" id="quickcheck-card">
