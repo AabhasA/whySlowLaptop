@@ -3211,6 +3211,16 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
 
 <div class="grid">
 
+  <div class="card heal" id="heal-card">
+    <h2>🩺 Heal My Mac<span class="help-tip" title="A plain-English summary of what's wrong and what to do next. Start here.">?</span></h2>
+    <div class="sub" id="heal-sub">Scanning…</div>
+    <div id="heal-list"></div>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+      <button class="primary" onclick="openDiagnoseModal()">Why is my Mac slow right now?</button>
+      <div class="path" style="margin-top:6px;font-size:11px">Pinpoints the single root cause + the exact fix.</div>
+    </div>
+  </div>
+
   <div class="card" id="memhogs-card">
     <h2>Memory Hogs<span class="help-tip" title="Apps using the most RAM right now, grouped by app (so all the Chrome tabs collapse into one row). Quit the top one to free swap pressure fastest.">?</span> <span class="count" id="memhogs-count"></span></h2>
     <p style="color:var(--dim);font-size:12px;margin:0 0 10px">
@@ -3219,16 +3229,6 @@ button.kill-never{background:#1b2230;color:#5a6478;border-color:#272f3f;cursor:n
       Existing swap-on-disk only clears with a reboot.
     </p>
     <div id="memhogs-list"></div>
-  </div>
-
-  <div class="card heal" id="heal-card">
-    <h2>🩺 Heal My Mac<span class="help-tip" title="A plain-English summary of what's wrong and what to do next. Start here.">?</span></h2>
-    <div class="sub" id="heal-sub">Scanning…</div>
-    <div id="heal-list"></div>
-    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
-      <button class="primary" onclick="openDiagnoseModal()">Why is my Mac slow right now?</button>
-      <span class="path" style="margin-left:10px;font-size:11px">Pinpoints the single root cause + the exact fix.</span>
-    </div>
   </div>
 
   <div class="card" id="permissions-card" style="display:none">
